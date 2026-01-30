@@ -15,6 +15,7 @@ from __future__ import annotations
 
 import argparse
 import datetime as _dt
+import gc
 import json
 import logging
 import os
@@ -3265,16 +3266,30 @@ def process_showtech_text(source_id: str, text: str, mode: str, as_json: bool, d
     # Load into memory, parse, then drop raw text reference
     parser = TechSupportParser()
     blocks = parser.parse(text)
-    text = ""  # release
+    text = ""  # release raw text reference
 
     ctx = TechSupportContext(source_id, blocks)
     results = run_all_checks(ctx)
     brief = make_device_brief(ctx, results)
 
+    # Generate report
     if as_json:
-        return format_json_report(ctx, brief, results, mode)
+        report = format_json_report(ctx, brief, results, mode)
     else:
-        return format_human_report(ctx, brief, results, mode, debug, show_checks_in_brief)
+        report = format_human_report(ctx, brief, results, mode, debug, show_checks_in_brief)
+    
+    # Explicitly release large objects to help garbage collection
+    # Note: Python's garbage collector will handle this, but explicit cleanup
+    # helps ensure memory is freed promptly, especially when processing multiple files
+    del blocks
+    del ctx
+    del results
+    del brief
+    
+    # Force garbage collection for large objects
+    gc.collect()
+    
+    return report
 
 
 def main(argv: Optional[Sequence[str]] = None) -> None:
@@ -3313,6 +3328,9 @@ def main(argv: Optional[Sequence[str]] = None) -> None:
                     continue
                 report = process_showtech_text(str(f), text, args.mode, args.json, args.debug, args.show_checks_in_brief)
                 outputs.append(report)
+                # Release text reference after processing
+                del text
+                gc.collect()
         elif path.is_file():
             # Decide if archive or plain show-tech file
             if zipfile.is_zipfile(path) or tarfile.is_tarfile(path):
@@ -3342,6 +3360,9 @@ def main(argv: Optional[Sequence[str]] = None) -> None:
                         f"{arch}!{spec.display_name}", text, args.mode, args.json, args.debug, args.show_checks_in_brief
                     )
                     outputs.append(report)
+                    # Release text reference after processing
+                    del text
+                    gc.collect()
             else:
                 LOG.info("Processing show-tech file: %s", path)
                 try:
@@ -3351,6 +3372,9 @@ def main(argv: Optional[Sequence[str]] = None) -> None:
                     continue
                 report = process_showtech_text(str(path), text, args.mode, args.json, args.debug, args.show_checks_in_brief)
                 outputs.append(report)
+                # Release text reference after processing
+                del text
+                gc.collect()
         else:
             LOG.error("Path does not exist or is not accessible: %s", path)
 
