@@ -2563,6 +2563,52 @@ class RunningConfigCheck(BaseCheck):
         ]
 
 
+@register_check
+class InventoryCheck(BaseCheck):
+    name = "inventory"
+    category = "hardware"
+    supported_platforms = ("all",)
+
+    def run(self, ctx: TechSupportContext) -> List[CheckResult]:
+        blocks = ctx.get_blocks("show inventory")
+        if not blocks:
+            return [
+                CheckResult(
+                    name=self.name,
+                    category=self.category,
+                    severity=Severity.INFO,
+                    summary="show inventory output not found.",
+                )
+            ]
+        
+        # Record all inventory information
+        lines = blocks[0].lines
+        # Filter out empty lines and command delimiters
+        inventory_lines = []
+        for line in lines:
+            stripped = line.strip()
+            if stripped and not stripped.startswith("---"):
+                inventory_lines.append(stripped)
+        
+        if inventory_lines:
+            summary = f"Found inventory information ({len(inventory_lines)} line(s))."
+            # Include all inventory lines in details
+            details = inventory_lines
+        else:
+            summary = "show inventory output is empty."
+            details = []
+        
+        return [
+            CheckResult(
+                name=self.name,
+                category=self.category,
+                severity=Severity.OK,
+                summary=summary,
+                details=details,
+            )
+        ]
+
+
 def run_all_checks(ctx: TechSupportContext) -> List[CheckResult]:
     results: List[CheckResult] = []
     # Core info parsers (populate context)
@@ -2748,6 +2794,7 @@ def _infer_command_from_check(check: CheckResult) -> Optional[str]:
         "hardware_fpga_error": "show hardware fpga error",
         "scd_satellite_retry_error": "show platform scd satellite debug",
         "running_config_check": "show running-config sanitized",
+        "inventory": "show inventory",
     }
     return name_to_cmd.get(check.name)
 
@@ -2819,34 +2866,50 @@ def format_human_report(
                     lines.append(f"Check: {check_name} (not found or not executed)")
                     lines.append("-" * 80)
     
-    if mode == "brief":
+    # In brief mode without debug, return early
+    # In brief mode with debug, continue to show debug output for selected checks
+    if mode == "brief" and not debug:
         return "\n".join(lines)
-
-    # verbose/debug: detailed checks with horizontal separators
-    lines.append("")
-    lines.append("Detailed checks:")
-    lines.append("-" * 80)
+    
+    # If brief mode with debug, filter results to only selected checks
+    # Then continue with normal debug output logic below
+    if mode == "brief" and debug and show_checks_in_brief is not None and len(show_checks_in_brief) > 0:
+        # Filter results to only selected checks
+        selected_results = [r for r in results if r.name in show_checks_in_brief]
+        results = selected_results
+        # Add separator before debug output (skip "Detailed checks:" header)
+        lines.append("")
+        lines.append("Debug output for selected checks:")
+        lines.append("-" * 80)
+    else:
+        # verbose/debug: detailed checks with horizontal separators
+        lines.append("")
+        lines.append("Detailed checks:")
+        lines.append("-" * 80)
     
     for r in results:
-        lines.append(f"[{r.severity.value}] {r.category}/{r.name}: {r.summary}")
-        
-        # In verbose mode, limit details to avoid excessive output
-        # Show only summary and important lines (max 10 details)
-        if mode == "verbose" and not debug:
-            max_details = 10
-            filtered_details = [d for d in r.details if not d.startswith("[DEBUG raw")]
-            if len(filtered_details) > max_details:
-                for d in filtered_details[:max_details]:
-                    lines.append(f"  {d}")
-                lines.append(f"  ... and {len(filtered_details) - max_details} more item(s)")
-            else:
-                for d in filtered_details:
-                    lines.append(f"  {d}")
-        elif debug:
-            # In debug mode, show all details (except legacy debug raw)
-            for d in r.details:
-                if not d.startswith("[DEBUG raw"):
-                    lines.append(f"  {d}")
+        # In brief mode with debug and selected checks, skip summary/details (already shown above)
+        # Only show debug raw output
+        if not (mode == "brief" and debug and show_checks_in_brief is not None and len(show_checks_in_brief) > 0):
+            lines.append(f"[{r.severity.value}] {r.category}/{r.name}: {r.summary}")
+            
+            # In verbose mode, limit details to avoid excessive output
+            # Show only summary and important lines (max 10 details)
+            if mode == "verbose" and not debug:
+                max_details = 10
+                filtered_details = [d for d in r.details if not d.startswith("[DEBUG raw")]
+                if len(filtered_details) > max_details:
+                    for d in filtered_details[:max_details]:
+                        lines.append(f"  {d}")
+                    lines.append(f"  ... and {len(filtered_details) - max_details} more item(s)")
+                else:
+                    for d in filtered_details:
+                        lines.append(f"  {d}")
+            elif debug:
+                # In debug mode, show all details (except legacy debug raw)
+                for d in r.details:
+                    if not d.startswith("[DEBUG raw"):
+                        lines.append(f"  {d}")
         
         # In debug mode, output full raw command output (not truncated)
         # Exception: fap_fabric_serdes outputs filtered lines matching regex pattern
