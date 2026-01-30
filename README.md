@@ -1,93 +1,262 @@
-# health_check_for_arista
+# Arista EOS Health Check Tool
 
+A comprehensive health check tool for analyzing Arista EOS device show-tech files and support-bundle diagnostic archives.
 
-
-## Getting started
-
-To make it easy for you to get started with GitLab, here's a list of recommended next steps.
-
-Already a pro? Just edit this README.md and make it your own. Want to make it easy? [Use the template at the bottom](#editing-this-readme)!
-
-## Add your files
-
-* [Create](https://docs.gitlab.com/ee/user/project/repository/web_editor.html#create-a-file) or [upload](https://docs.gitlab.com/ee/user/project/repository/web_editor.html#upload-a-file) files
-* [Add files using the command line](https://docs.gitlab.com/topics/git/add_files/#add-files-to-a-git-repository) or push an existing Git repository with the following command:
-
-```
-cd existing_repo
-git remote add origin https://gitlab.aristanetworks.com/chris.li/health_check_for_arista.git
-git branch -M main
-git push -uf origin main
-```
-
-## Integrate with your tools
-
-* [Set up project integrations](https://gitlab.aristanetworks.com/chris.li/health_check_for_arista/-/settings/integrations)
-
-## Collaborate with your team
-
-* [Invite team members and collaborators](https://docs.gitlab.com/ee/user/project/members/)
-* [Create a new merge request](https://docs.gitlab.com/ee/user/project/merge_requests/creating_merge_requests.html)
-* [Automatically close issues from merge requests](https://docs.gitlab.com/ee/user/project/issues/managing_issues.html#closing-issues-automatically)
-* [Enable merge request approvals](https://docs.gitlab.com/ee/user/project/merge_requests/approvals/)
-* [Set auto-merge](https://docs.gitlab.com/user/project/merge_requests/auto_merge/)
-
-## Test and Deploy
-
-Use the built-in continuous integration in GitLab.
-
-* [Get started with GitLab CI/CD](https://docs.gitlab.com/ee/ci/quick_start/)
-* [Analyze your code for known vulnerabilities with Static Application Security Testing (SAST)](https://docs.gitlab.com/ee/user/application_security/sast/)
-* [Deploy to Kubernetes, Amazon EC2, or Amazon ECS using Auto Deploy](https://docs.gitlab.com/ee/topics/autodevops/requirements.html)
-* [Use pull-based deployments for improved Kubernetes management](https://docs.gitlab.com/ee/user/clusters/agent/)
-* [Set up protected environments](https://docs.gitlab.com/ee/ci/environments/protected_environments.html)
-
-***
-
-# Editing this README
-
-When you're ready to make this README your own, just edit this file and use the handy template below (or feel free to structure it however you want - this is just a starting point!). Thanks to [makeareadme.com](https://www.makeareadme.com/) for this template.
-
-## Suggestions for a good README
-
-Every project is different, so consider which of these sections apply to yours. The sections used in the template are suggestions for most open source projects. Also keep in mind that while a README can be too long and detailed, too long is better than too short. If you think your README is too long, consider utilizing another form of documentation rather than cutting out information.
-
-## Name
-Choose a self-explaining name for your project.
+**Author**: chris.li@arista.com  
+**Company**: Arista Networks  
+**Last Modified**: 2026-01-30
 
 ## Description
-Let people know what your project can do specifically. Provide context and add a link to any reference visitors might be unfamiliar with. A list of Features or a Background subsection can also be added here. If there are alternatives to your project, this is a good place to list differentiating factors.
 
-## Badges
-On some READMEs, you may see small images that convey metadata, such as whether or not all the tests are passing for the project. You can use Shields to add some to your README. Many services also have instructions for adding a badge.
+This tool analyzes Arista EOS show-tech / show-tech-support-all outputs and related support-bundle archives/directories to generate health reports. It supports multiple input formats, platform-specific checks, and flexible output modes.
 
-## Visuals
-Depending on what you are making, it can be a good idea to include screenshots or even a video (you'll frequently see GIFs rather than actual videos). Tools like ttygif can help, but check out Asciinema for a more sophisticated method.
+## Features
+
+- **Multiple Input Formats**:
+  - Single or multiple show-tech files
+  - Unpacked support-bundle directories
+  - Single support-bundle archive files (zip, tar, tar.gz, tgz)
+  - Nested archives (archives containing other archives)
+
+- **Platform Support** (phased implementation):
+  - Phase 1: 78xx series
+  - Phase 2: 75xx series
+  - Phase 3: 7368 and 7289 series
+  - Phase 4: Other series
+
+- **Output Modes**:
+  - Brief mode: Summary with key information (hostname, version, model, system time, health status)
+  - Verbose mode: Detailed output for all checked items
+  - Debug mode: Full raw command outputs for troubleshooting
+  - JSON mode: Machine-readable JSON format
+
+- **Comprehensive Health Checks**:
+  - System information (version, uptime, memory, temperature, cooling)
+  - Process monitoring (CPU usage, memory usage)
+  - Hardware status (modules, PCI errors, FPGA errors)
+  - Interface statistics (errors, discards, queue drops)
+  - Storage health (flash usage, storage status)
+  - Platform-specific checks (FAP fabric SerDes links, redundancy status)
+  - Configuration checks (running-config patterns)
+
+## Requirements
+
+- Python 3.6 or higher
+- Standard library only (no external dependencies)
 
 ## Installation
-Within a particular ecosystem, there may be a common way of installing things, such as using Yarn, NuGet, or Homebrew. However, consider the possibility that whoever is reading your README is a novice and would like more guidance. Listing specific steps helps remove ambiguity and gets people to using your project as quickly as possible. If it only runs in a specific context like a particular programming language version or operating system or has dependencies that have to be installed manually, also add a Requirements subsection.
+
+No installation required. Simply download the `health_check_eos.py` file and run it directly:
+
+```bash
+python3 health_check_eos.py --help
+```
 
 ## Usage
-Use examples liberally, and show the expected output if you can. It's helpful to have inline the smallest example of usage that you can demonstrate, while providing links to more sophisticated examples if they are too long to reasonably include in the README.
 
-## Support
-Tell people where they can go to for help. It can be any combination of an issue tracker, a chat room, an email address, etc.
+### Basic Usage
 
-## Roadmap
-If you have ideas for releases in the future, it is a good idea to list them in the README.
+```bash
+# Analyze a single show-tech file
+python3 health_check_eos.py /path/to/show-tech
 
-## Contributing
-State if you are open to contributions and what your requirements are for accepting them.
+# Analyze a support-bundle directory
+python3 health_check_eos.py /path/to/support-bundle/
 
-For people who want to make changes to your project, it's helpful to have some documentation on how to get started. Perhaps there is a script that they should run or some environment variables that they need to set. Make these steps explicit. These instructions could also be useful to your future self.
+# Analyze a compressed archive
+python3 health_check_eos.py /path/to/support-bundle.zip
 
-You can also document commands to lint the code or run tests. These steps help to ensure high code quality and reduce the likelihood that the changes inadvertently break something. Having instructions for running tests is especially helpful if it requires external setup, such as starting a Selenium server for testing in a browser.
+# Analyze multiple inputs
+python3 health_check_eos.py file1 file2 directory1 archive.zip
+```
 
-## Authors and acknowledgment
-Show your appreciation to those who have contributed to the project.
+### Command Line Options
+
+#### Output Modes
+
+- `-b, --brief`: Brief report mode (default)
+- `-v, --verbose`: Verbose report mode (includes all check details)
+- `-d, --debug`: Enable debug logging and show full raw outputs
+- `--json`: Output report in JSON format
+
+#### Output Control
+
+- `-o FILE, --output FILE`: Write report to FILE instead of stdout
+
+#### Information and Filtering
+
+- `-l, --list-checks`: List all supported health checks and exit
+- `-c [CHECK_NAME ...], --show-checks-in-brief [CHECK_NAME ...]`: 
+  - Show specified checks in brief mode output
+  - If no check names provided, shows all supported checks list
+  - Use `--list-checks` to see available check names
+
+#### Help
+
+- `-h, --help`: Show help message and exit
+
+### Examples
+
+```bash
+# List all supported checks
+python3 health_check_eos.py --list-checks
+
+# Brief mode with specific checks
+python3 health_check_eos.py -b -c memory_usage_top cpu_usage_top /path/to/show-tech
+
+# Verbose mode
+python3 health_check_eos.py -v /path/to/show-tech
+
+# Debug mode
+python3 health_check_eos.py -d /path/to/show-tech
+
+# JSON output
+python3 health_check_eos.py --json /path/to/show-tech -o report.json
+
+# Show all checks list in brief mode
+python3 health_check_eos.py -b -c /path/to/show-tech
+```
+
+## Health Checks
+
+The tool performs various health checks organized by category:
+
+### System Checks
+- `show version`: Hardware model, software version, architecture, uptime, free memory
+- `show clock`: System time
+- `show system env cooling`: Cooling status
+- `show system env temperature`: Temperature status
+- `show system health storage`: Storage health status and lifetime remaining
+
+### Process Checks
+- `show processes top once`: CPU usage monitoring
+- `show processes top memory once`: Memory usage monitoring
+
+### Hardware Checks
+- `show module`: Module uptime status
+- `show platform sand health`: Linecard and fabric card initialization status
+- `show platform fap fabric detail`: SerDes link status (78xx, 75xx)
+- `show redundancy status`: Redundancy protocol status (78xx, 75xx)
+- `show pci`: PCI errors (FatalErr, SMBusERR)
+- `show hardware counter drop`: Hardware drop counters
+- `show hardware capacity`: Hardware capacity usage
+- `show hardware fpga error`: FPGA errors
+- `show platform scd satellite debug`: SCD satellite retry errors (7368, 7289)
+
+### Storage Checks
+- `bash ls -ltr /var/core`: Core dump file detection
+- `bash df -h`: Flash filesystem usage
+
+### Interface Checks
+- `show interfaces counters queue drops`: Interface queue drops
+- `show interfaces counters discards`: Interface discards
+- `show interfaces counters errors`: Interface errors
+- `show cpu counters queue`: CPU queue drops
+
+### System Logs
+- `show agent logs crash`: Agent crash logs
+- `show logging threshold errors`: ECC/CRC error logs
+- `show system environment power detail`: Power input voltage
+
+### Configuration Checks
+- `show running-config sanitized`: Platform-specific configuration patterns
+- `show extensions detail`: Extension patch status
+
+## Output Format
+
+### Brief Mode
+
+Brief mode displays a summary table with:
+- Script execution time
+- Hostname
+- EOS version
+- Hardware model
+- System time
+- Overall health status (OK/WARN/ERROR) with counts
+
+### Verbose Mode
+
+Verbose mode includes:
+- All information from brief mode
+- Detailed output for all checked items
+- Summary and important lines/columns (limited to avoid excessive output)
+
+### Debug Mode
+
+Debug mode provides:
+- All information from brief and verbose modes
+- Full raw command outputs for troubleshooting
+- Filtered outputs for specific checks (e.g., only matching lines for regex-based checks)
+
+### JSON Mode
+
+JSON mode outputs structured data:
+```json
+{
+  "source": "file_path",
+  "brief": {
+    "script_time": "2026-01-30T15:00:00",
+    "hostname": "device-hostname",
+    "eos_version": "4.30.2F",
+    "hw_model": "Arista DCS-7816-CH",
+    "system_time": "Tue Jan 27 14:04:43 2026",
+    "health": "WARN",
+    "warn_count": 5,
+    "error_count": 0
+  },
+  "checks": [...]
+}
+```
+
+## Platform-Specific Features
+
+### 78xx Series
+- FAP fabric SerDes link checks (patterns: `U--- Ramon`, `I---I Ramon`, etc.)
+- Redundancy status checks
+- Running-config pattern checks
+
+### 75xx Series
+- FAP fabric SerDes link checks (patterns: `U--- Fe`, `I---I Fe`, etc.)
+- Redundancy status checks
+
+### 7368 and 7289 Series
+- SCD satellite retry error checks
+
+## File Discovery
+
+The tool automatically detects input type (file, directory, or archive) and searches for:
+- Exact filenames: `show-tech` or `show-tech-support-all`
+- Files in support-bundle directories: `support-bundle/tmp/support-bundle-cmds/show-tech`
+- Files in nested archives
+
+## Troubleshooting
+
+### Enable Debug Mode
+
+Use `-d` or `--debug` flag to see:
+- Processing logs (which files are being processed)
+- Full raw command outputs
+- Detailed parsing information
+
+### List Available Checks
+
+Use `-l` or `--list-checks` to see all supported checks with their commands and supported platforms.
+
+### View Specific Checks
+
+Use `-c` or `--show-checks-in-brief` to view details of specific checks in brief mode.
+
+## Notes
+
+- The tool loads files into memory for fast processing, then releases memory
+- Command blocks in show-tech files are identified by `---` delimiters (e.g., `------------- show—cmd -------------`)
+- Some checks are platform-specific and will return INFO if the platform doesn't match
+- The tool supports nested archives (archives containing other archives)
 
 ## License
-For open source projects, say how it is licensed.
 
-## Project status
-If you have run out of energy or time for your project, put a note at the top of the README saying that development has slowed down or stopped completely. Someone may choose to fork your project or volunteer to step in as a maintainer or owner, allowing your project to keep going. You can also make an explicit request for maintainers.
+Copyright (c) 2026 Arista Networks, Inc. All rights reserved.
+
+## Support
+
+For issues or questions, please contact: chris.li@arista.com
