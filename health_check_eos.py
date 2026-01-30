@@ -60,12 +60,13 @@ def build_arg_parser() -> argparse.ArgumentParser:
 
     parser.add_argument(
         "paths",
-        nargs="+",
+        nargs="*",
         metavar="PATH",
         help=(
             "One or more inputs: show-tech/show-tech-support-all file, "
             "unpacked support-bundle directory, or support-bundle archive "
-            "(tar/tar.gz/tgz/zip). Type is detected automatically."
+            "(tar/tar.gz/tgz/zip). Type is detected automatically. "
+            "Not required when using --list-checks."
         ),
     )
 
@@ -100,6 +101,23 @@ def build_arg_parser() -> argparse.ArgumentParser:
         "--debug",
         action="store_true",
         help="Enable debug logging.",
+    )
+    debug_group.add_argument(
+        "-l",
+        "--list-checks",
+        action="store_true",
+        help="List all supported health checks and exit.",
+    )
+    debug_group.add_argument(
+        "-c",
+        "--show-checks-in-brief",
+        nargs="*",
+        metavar="CHECK_NAME",
+        help=(
+            "Show specified checks in brief mode output. "
+            "If no check names provided, shows all supported checks list. "
+            "Use --list-checks to see available check names."
+        ),
     )
 
     return parser
@@ -162,6 +180,7 @@ class CheckResult:
     severity: Severity
     summary: str
     details: List[str] = field(default_factory=list)
+    command: Optional[str] = None  # Command name for debug output
 
 
 @dataclass
@@ -179,8 +198,8 @@ class DeviceBrief:
 class TechSupportParser:
     """Parse a show-tech / show-tech-support-all text into command blocks."""
 
-    # Match lines like: ------------- show version ------------- or similar
-    CMD_HEADER_RE = re.compile(r"^[-\s]+show.*[-\s]+$", re.IGNORECASE)
+    # Match lines like: ------------- show version ------------- or ------------- bash ls -ltr /var/core -------------
+    CMD_HEADER_RE = re.compile(r"^[-\s]+(?:show|bash).*[-\s]+$", re.IGNORECASE)
 
     @classmethod
     def parse(cls, text: str) -> List[CommandBlock]:
@@ -201,10 +220,10 @@ class TechSupportParser:
                 # New command block header
                 flush_block()
                 # Normalise header to extract command name approx after the leading dashes.
-                # Example: "------------- show version -------------"
+                # Example: "------------- show version -------------" or "------------- bash ls -ltr /var/core -------------"
                 cmd = raw.strip("- ").strip()
-                # Some headers might contain extra decorations; just keep from 'show'.
-                m = re.search(r"(show.*)$", cmd, re.IGNORECASE)
+                # Try to match "show ..." or "bash ..." commands
+                m = re.search(r"((?:show|bash).*)$", cmd, re.IGNORECASE)
                 if m:
                     cmd = m.group(1).strip()
                 current_cmd = cmd.lower()
@@ -643,9 +662,20 @@ def infer_platform_series(hw_model: Optional[str]) -> str:
     if not hw_model:
         return "other"
     model = hw_model.lower()
-    if model.startswith("dcs-78") or "7800" in model or model.startswith("780"):
+    # Match patterns like "dcs-78xx", "7800", "780", "78xx" etc.
+    if (
+        "dcs-78" in model
+        or "7800" in model
+        or model.startswith("780")
+        or re.search(r"\b78\d{2}", model)
+    ):
         return "78xx"
-    if model.startswith("dcs-75") or "7500" in model or model.startswith("750"):
+    # Match patterns like "dcs-75xx", "7500", "7516", "75xx" etc.
+    if (
+        "dcs-75" in model
+        or "7500" in model
+        or re.search(r"\b75\d{2}", model)
+    ):
         return "75xx"
     if "7368" in model:
         return "7368"
@@ -939,17 +969,9 @@ def _parse_numeric_with_unit(token: str) -> Optional[int]:
 
 
 def _maybe_add_debug_raw(details: List[str], cmd: str, lines: Sequence[str]) -> None:
-    """Append raw command output to details when debug logging is enabled."""
-    if not LOG.isEnabledFor(logging.DEBUG):
-        return
-    if not lines:
-        return
-    max_lines = 50
-    snippet_lines = list(lines[:max_lines])
-    if len(lines) > max_lines:
-        snippet_lines.append(f"... ({len(lines) - max_lines} more line(s) truncated)")
-    snippet = "\n".join(snippet_lines)
-    details.append(f"[DEBUG raw {cmd}]\n{snippet}")
+    """Legacy function - no longer adds debug output to details.
+    Full raw output is now handled in format_human_report when debug=True."""
+    pass
 
 
 @register_check
@@ -971,22 +993,43 @@ class CpuUsageCheck(BaseCheck):
             ]
         lines = blocks[0].lines
         offenders = []
-        for line in lines:
-            if not line.strip() or "%CPU" in line:
-                continue
-            parts = line.split()
-            # Look for a numeric token representing %CPU
-            cpu_val = None
-            for tok in parts:
-                if tok.replace(".", "", 1).isdigit():
+        
+        # Find %CPU column index from header and header line index
+        cpu_col_idx = None
+        header_line_idx = None
+        for idx, line in enumerate(lines):
+            if "%CPU" in line:
+                parts = line.split()
+                try:
+                    cpu_col_idx = parts.index("%CPU")
+                    header_line_idx = idx
+                    break
+                except ValueError:
+                    # Try case-insensitive search
+                    parts_lower = [p.lower() for p in parts]
                     try:
-                        v = float(tok)
+                        cpu_col_idx = parts_lower.index("%cpu")
+                        header_line_idx = idx
+                        break
                     except ValueError:
                         continue
-                    if v >= 0 and v <= 800:  # crude sanity
-                        cpu_val = v
-                        break
-            if cpu_val is None:
+        
+        if cpu_col_idx is None:
+            # Fallback: assume %CPU is ninth column (index 8, 0-based)
+            cpu_col_idx = 8
+            header_line_idx = 0  # Assume first line is header
+        
+        # Parse data lines (only lines after the header)
+        start_idx = (header_line_idx + 1) if header_line_idx is not None else 1
+        for line in lines[start_idx:]:
+            if not line.strip():
+                continue
+            parts = line.split()
+            if len(parts) <= cpu_col_idx:
+                continue
+            try:
+                cpu_val = float(parts[cpu_col_idx])
+            except (ValueError, IndexError):
                 continue
             if cpu_val > 99:
                 offenders.append((line.strip(), cpu_val))
@@ -1031,34 +1074,85 @@ class MemoryUsageCheck(BaseCheck):
                 )
             ]
         lines = blocks[0].lines
-        offenders = []
-        for line in lines:
-            if not line.strip() or "RES" in line:
+        offenders_1g = []  # RES > 1GB
+        offenders_2g = []  # RES > 2GB
+        
+        # Find the header line to determine RES column index
+        res_col_idx = None
+        header_line_idx = None
+        for idx, line in enumerate(lines):
+            stripped = line.strip()
+            if not stripped:
                 continue
-            parts = line.split()
-            # Try to find a token that looks like RES (e.g. 500m, 1g)
-            res_bytes = None
-            for tok in parts:
-                val = _parse_numeric_with_unit(tok)
-                if val is not None:
-                    res_bytes = val
+            # Look for header line containing "RES"
+            if "RES" in stripped and "PID" in stripped:
+                # This is the header line
+                parts = stripped.split()
+                # Find RES column index
+                for i, part in enumerate(parts):
+                    if part == "RES":
+                        res_col_idx = i
+                        header_line_idx = idx
+                        break
+                if res_col_idx is not None:
                     break
-            if res_bytes is None:
-                continue
-            if res_bytes > 1024**3:  # >1g
-                offenders.append((line.strip(), res_bytes))
-        if not offenders:
-            return [
-                CheckResult(
-                    name=self.name,
-                    category=self.category,
-                    severity=Severity.OK,
-                    summary="No processes with RES > 1g.",
-                )
-            ]
-        sev = Severity.WARN if any(v > 2 * 1024**3 for _, v in offenders) else Severity.INFO
-        summary = f"{len(offenders)} process(es) with RES > 1g."
-        details = [f"{ln} (RES={v} bytes)" for ln, v in offenders]
+        
+        # If we found the header, process data rows
+        if res_col_idx is not None and header_line_idx is not None:
+            # Process lines after header
+            for line in lines[header_line_idx + 1:]:
+                stripped = line.strip()
+                if not stripped:
+                    continue
+                # Skip separator lines or lines that look like headers
+                if "RES" in stripped and "PID" in stripped:
+                    continue
+                
+                parts = stripped.split()
+                # Check if we have enough columns
+                if len(parts) > res_col_idx:
+                    # Extract RES value from the correct column
+                    res_token = parts[res_col_idx]
+                    res_bytes = _parse_numeric_with_unit(res_token)
+                    if res_bytes is not None:
+                        if res_bytes > 1024**3:  # >1g
+                            offenders_1g.append((stripped, res_bytes))
+                            if res_bytes > 2 * 1024**3:  # >2g
+                                offenders_2g.append((stripped, res_bytes))
+        else:
+            # Fallback: if header not found, try old method (find first parseable value)
+            for line in lines:
+                if not line.strip() or "RES" in line:
+                    continue
+                parts = line.split()
+                # Try to find a token that looks like RES (e.g. 500m, 1g)
+                res_bytes = None
+                for tok in parts:
+                    val = _parse_numeric_with_unit(tok)
+                    if val is not None:
+                        res_bytes = val
+                        break
+                if res_bytes is None:
+                    continue
+                if res_bytes > 1024**3:  # >1g
+                    offenders_1g.append((line.strip(), res_bytes))
+                    if res_bytes > 2 * 1024**3:  # >2g
+                        offenders_2g.append((line.strip(), res_bytes))
+        
+        # Determine severity
+        if offenders_2g:
+            sev = Severity.WARN
+        elif offenders_1g:
+            sev = Severity.INFO
+        else:
+            sev = Severity.OK
+        
+        # Build summary with both counts (always show, even if zero)
+        summary = f"RES > 1GB: {len(offenders_1g)} process(es), RES > 2GB: {len(offenders_2g)} process(es)."
+        
+        # Details: include all offenders > 1GB
+        details = [f"{ln} (RES={v} bytes)" for ln, v in offenders_1g]
+        
         return [
             CheckResult(
                 name=self.name,
@@ -1078,6 +1172,7 @@ class ModuleUptimeCheck(BaseCheck):
 
     def run(self, ctx: TechSupportContext) -> List[CheckResult]:
         blocks = ctx.get_blocks("show module")
+        LOG.debug("module_uptime check: found %d block(s) for 'show module'", len(blocks))
         if not blocks:
             return [
                 CheckResult(
@@ -1098,16 +1193,16 @@ class ModuleUptimeCheck(BaseCheck):
                 CheckResult(
                     name=self.name,
                     category=self.category,
-                    severity=Severity.INFO,
-                    summary="No obviously abnormal module uptime detected.",
+                    severity=Severity.OK,
+                    summary="No abnormal module uptime detected.",
                 )
             ]
         return [
             CheckResult(
                 name=self.name,
                 category=self.category,
-                severity=Severity.INFO,
-                summary=f"{len(anomalous)} module(s) with potentially abnormal uptime.",
+                severity=Severity.WARN,
+                summary=f"{len(anomalous)} module(s) with abnormal uptime detected.",
                 details=anomalous,
             )
         ]
@@ -1121,6 +1216,7 @@ class SandHealthCheck(BaseCheck):
 
     def run(self, ctx: TechSupportContext) -> List[CheckResult]:
         blocks = ctx.get_blocks("show platform sand health")
+        LOG.debug("platform_sand_health check: found %d block(s) for 'show platform sand health'", len(blocks))
         if not blocks:
             return [
                 CheckResult(
@@ -1133,10 +1229,10 @@ class SandHealthCheck(BaseCheck):
         text = "\n".join(blocks[0].lines)
         if re.search(r"fail|error|not\s+initial", text, re.IGNORECASE):
             sev = Severity.WARN
-            summary = "Detected possible linecard/fabric initialization issues in sand health."
+            summary = "Detected linecard/fabric initialization issues in sand health."
         else:
             sev = Severity.OK
-            summary = "No obvious initialization failures in sand health."
+            summary = "All linecards and fabric cards initialized successfully."
         return [
             CheckResult(
                 name=self.name,
@@ -1155,6 +1251,7 @@ class FapFabricSerdesCheck(BaseCheck):
 
     def run(self, ctx: TechSupportContext) -> List[CheckResult]:
         blocks = ctx.get_blocks("show platform fap fabric detail")
+        LOG.debug("fap_fabric_serdes check: found %d block(s) for 'show platform fap fabric detail'", len(blocks))
         if not blocks:
             return [
                 CheckResult(
@@ -1164,24 +1261,43 @@ class FapFabricSerdesCheck(BaseCheck):
                     summary="show platform fap fabric detail output not found.",
                 )
             ]
-        text = "\n".join(blocks[0].lines)
+        lines = blocks[0].lines
         if ctx.platform_series == "78xx":
-            pattern = r"(U--- Ramon|---U Ramon|I--- Ramon|---I Ramon|\|--- Ramon|---\| Ramon)"
+            # Pattern: U--- Ramon|---U Ramon|I--- Ramon|I---I Ramon|---I Ramon|\|--- Ramon|---\| Ramon
+            # Note: I---I Ramon is also a valid pattern (I---I followed by Ramon without space)
+            # In Python regex, \| matches literal |, so we use [|] or \| to match |
+            pattern = r"(U--- Ramon|[|]---U Ramon|I---I? Ramon|[|]---I Ramon|[|]--- Ramon|---[|] Ramon)"
         else:
-            pattern = r"(U--- Fe|---U Fe|I--- Fe|---I Fe|\|--- Fe|---\| Fe)"
-        matches = re.findall(pattern, text)
-        if matches:
+            # Pattern: U--- Fe|---U Fe|I--- Fe|I---I Fe|---I Fe|\|--- Fe|---\| Fe
+            # Note: I---I Fe is also a valid pattern (I---I followed by Fe without space)
+            pattern = r"(U--- Fe|[|]---U Fe|I---I? Fe|[|]---I Fe|[|]--- Fe|---[|] Fe)"
+        
+        # Find matching lines (output full lines like egrep)
+        matched_lines = []
+        for line in lines:
+            if re.search(pattern, line):
+                stripped = line.strip()
+                if stripped:
+                    matched_lines.append(stripped)
+        
+        if matched_lines:
             sev = Severity.WARN
-            summary = f"Detected {len(matches)} abnormal SerDes link entries in FAP fabric detail."
+            summary = f"Detected {len(matched_lines)} abnormal SerDes link entries in FAP fabric detail."
+            # Output full lines (like egrep output)
+            details = matched_lines[:10]  # Limit to first 10 for normal output
+            if len(matched_lines) > 10:
+                details.append(f"... and {len(matched_lines) - 10} more")
         else:
             sev = Severity.OK
             summary = "No abnormal SerDes link entries detected in FAP fabric detail."
+            details = []
         return [
             CheckResult(
                 name=self.name,
                 category=self.category,
                 severity=sev,
                 summary=summary,
+                details=details,
             )
         ]
 
@@ -1194,6 +1310,7 @@ class RedundancyStatusCheck(BaseCheck):
 
     def run(self, ctx: TechSupportContext) -> List[CheckResult]:
         blocks = ctx.get_blocks("show redundancy status")
+        LOG.debug("redundancy_status check: found %d block(s) for 'show redundancy status'", len(blocks))
         if not blocks:
             return [
                 CheckResult(
@@ -1210,10 +1327,27 @@ class RedundancyStatusCheck(BaseCheck):
         for line in lines:
             if "ACTIVE" in line and "unit 1" in line:
                 active_unit1 = True
+            # Match "Redundancy Protocol (Operational): <value>" or similar formats
             if "Redundancy Protocol (Operational)" in line:
-                op_proto = line.split(":", 1)[-1].strip()
+                # Try multiple formats: "key: value", "key = value", etc.
+                parts = re.split(r"[:=]", line, 1)
+                if len(parts) > 1:
+                    op_proto = parts[-1].strip()
+                else:
+                    # Fallback: extract text after the key
+                    m = re.search(r"Redundancy Protocol \(Operational\)\s+(.+)", line, re.IGNORECASE)
+                    if m:
+                        op_proto = m.group(1).strip()
+            # Match "Redundancy Protocol (Configured): <value>" or similar formats
             if "Redundancy Protocol (Configured)" in line:
-                cfg_proto = line.split(":", 1)[-1].strip()
+                parts = re.split(r"[:=]", line, 1)
+                if len(parts) > 1:
+                    cfg_proto = parts[-1].strip()
+                else:
+                    # Fallback: extract text after the key
+                    m = re.search(r"Redundancy Protocol \(Configured\)\s+(.+)", line, re.IGNORECASE)
+                    if m:
+                        cfg_proto = m.group(1).strip()
         results: List[CheckResult] = []
         if active_unit1:
             results.append(
@@ -1234,13 +1368,16 @@ class RedundancyStatusCheck(BaseCheck):
                 )
             )
         if op_proto and cfg_proto:
-            if op_proto == cfg_proto:
+            # Normalize protocol values for comparison (case-insensitive, strip whitespace)
+            op_proto_norm = op_proto.strip().lower()
+            cfg_proto_norm = cfg_proto.strip().lower()
+            if op_proto_norm == cfg_proto_norm:
                 results.append(
                     CheckResult(
                         name=f"{self.name}_protocol",
                         category=self.category,
                         severity=Severity.OK,
-                        summary=f"Redundancy Protocol Operational and Configured both '{op_proto}'.",
+                        summary=f"Redundancy Protocol Operational and Configured both '{op_proto.strip()}'.",
                     )
                 )
             else:
@@ -1251,10 +1388,23 @@ class RedundancyStatusCheck(BaseCheck):
                         severity=Severity.WARN,
                         summary=(
                             "Redundancy Protocol mismatch: "
-                            f"Operational='{op_proto}', Configured='{cfg_proto}'."
+                            f"Operational='{op_proto.strip()}', Configured='{cfg_proto.strip()}'."
                         ),
                     )
                 )
+        elif op_proto or cfg_proto:
+            # Only one protocol found
+            results.append(
+                CheckResult(
+                    name=f"{self.name}_protocol",
+                    category=self.category,
+                    severity=Severity.INFO,
+                    summary=(
+                        f"Redundancy Protocol partially found: "
+                        f"Operational='{op_proto or 'N/A'}', Configured='{cfg_proto or 'N/A'}'."
+                    ),
+                )
+            )
         return results
 
 
@@ -1275,16 +1425,66 @@ class PciErrorCheck(BaseCheck):
                     summary="show pci output not found.",
                 )
             ]
-        text = "\n".join(blocks[0].lines)
-        if re.search(r"FatalErr", text, re.IGNORECASE) or re.search(
-            r"SMBusERR", text, re.IGNORECASE
-        ):
+        lines = blocks[0].lines
+        offenders = []
+        
+        # Find column indices for FatalErr and SMBusERR from header
+        fatal_col_idx = None
+        smbus_col_idx = None
+        header_line_idx = None
+        
+        for idx, line in enumerate(lines):
+            if not line.strip():
+                continue
+            # Look for header line containing FatalErr and/or SMBusERR
+            parts = line.split()
+            parts_lower = [p.lower() for p in parts]
+            if "fatalerr" in parts_lower or "smbuserr" in parts_lower:
+                try:
+                    if "fatalerr" in parts_lower:
+                        fatal_col_idx = parts_lower.index("fatalerr")
+                    if "smbuserr" in parts_lower:
+                        smbus_col_idx = parts_lower.index("smbuserr")
+                    header_line_idx = idx
+                    break
+                except ValueError:
+                    continue
+        
+        # If columns found, parse data rows
+        if fatal_col_idx is not None or smbus_col_idx is not None:
+            # Parse data lines (after header)
+            start_idx = (header_line_idx + 1) if header_line_idx is not None else 0
+            for line in lines[start_idx:]:
+                if not line.strip():
+                    continue
+                parts = line.split()
+                
+                # Check FatalErr column
+                if fatal_col_idx is not None and len(parts) > fatal_col_idx:
+                    try:
+                        fatal_val = int(parts[fatal_col_idx])
+                        if fatal_val != 0:
+                            offenders.append(f"FatalErr={fatal_val}: {line.strip()}")
+                    except (ValueError, IndexError):
+                        pass
+                
+                # Check SMBusERR column
+                if smbus_col_idx is not None and len(parts) > smbus_col_idx:
+                    try:
+                        smbus_val = int(parts[smbus_col_idx])
+                        if smbus_val != 0:
+                            offenders.append(f"SMBusERR={smbus_val}: {line.strip()}")
+                    except (ValueError, IndexError):
+                        pass
+        
+        if offenders:
             return [
                 CheckResult(
                     name=self.name,
                     category=self.category,
                     severity=Severity.WARN,
-                    summary="Detected FatalErr or SMBusERR in PCI output.",
+                    summary=f"Detected non-zero FatalErr or SMBusERR in PCI output ({len(offenders)} entry/ies).",
+                    details=offenders,
                 )
             ]
         return [
@@ -1292,7 +1492,7 @@ class PciErrorCheck(BaseCheck):
                 name=self.name,
                 category=self.category,
                 severity=Severity.OK,
-                summary="No FatalErr or SMBusERR found in PCI output.",
+                summary="No non-zero FatalErr or SMBusERR detected in PCI output.",
             )
         ]
 
@@ -1386,11 +1586,25 @@ class PowerInputCheck(BaseCheck):
         ]
 
 
+# Configurable regex patterns for logging threshold errors check
+# Easy to add/modify/remove patterns without changing code logic
+LOGGING_THRESHOLD_ERROR_PATTERNS = [
+    r"\bECC\b",
+    r"\bCRC\b",
+    # Add more patterns here as needed, e.g.:
+    # r"\bFATAL\b",
+    # r"\bCRITICAL\b",
+]
+
+
 @register_check
 class LoggingThresholdErrorsCheck(BaseCheck):
     name = "logging_threshold_errors"
     category = "hardware"
     supported_platforms = ("all",)
+    
+    # Use shared patterns list
+    ERROR_PATTERNS = LOGGING_THRESHOLD_ERROR_PATTERNS
 
     def run(self, ctx: TechSupportContext) -> List[CheckResult]:
         blocks = ctx.get_blocks("show logging threshold errors")
@@ -1403,14 +1617,26 @@ class LoggingThresholdErrorsCheck(BaseCheck):
                     summary="show logging threshold errors output not found.",
                 )
             ]
-        text = "\n".join(blocks[0].lines)
-        if re.search(r"\bECC\b", text) or re.search(r"\bCRC\b", text):
+        lines = blocks[0].lines
+        matching_lines = []
+        
+        # Check each line against all patterns
+        for line in lines:
+            for pattern in self.ERROR_PATTERNS:
+                if re.search(pattern, line, re.IGNORECASE):
+                    matching_lines.append(line.strip())
+                    break  # Only add line once even if multiple patterns match
+        
+        if matching_lines:
+            # Store matching lines in details for debug output
             return [
                 CheckResult(
                     name=self.name,
                     category=self.category,
                     severity=Severity.WARN,
-                    summary="ECC or CRC error logs detected in logging threshold errors.",
+                    summary=f"Error patterns detected in logging threshold errors ({len(matching_lines)} matching line(s)).",
+                    details=matching_lines,
+                    command="show logging threshold errors",  # Store command for debug filtering
                 )
             ]
         return [
@@ -1418,9 +1644,137 @@ class LoggingThresholdErrorsCheck(BaseCheck):
                 name=self.name,
                 category=self.category,
                 severity=Severity.OK,
-                summary="No ECC/CRC error logs detected in logging threshold errors.",
+                summary="No error patterns detected in logging threshold errors.",
             )
         ]
+
+
+def _parse_queue_drops_output(lines: List[str]) -> Tuple[Optional[str], List[str]]:
+    """
+    Parse 'show interfaces counters queue drops' output.
+    Only matches:
+    - Header line: contains DropPkts or DropOctets
+    - Port lines: 2-3 columns (e.g., "Et12/1/1            TC0"), recorded as context
+    - VOQ lines: start with "VOQ", recorded only if DropPkts or DropOctets is non-zero
+    - Egress queue lines: precisely match lines containing "Egress queue" string,
+      recorded only if DropPkts or DropOctets is non-zero
+    
+    Returns:
+        (header_line, matched_lines) tuple
+    """
+    header_line = None
+    drop_pkts_col_idx = None
+    drop_octets_col_idx = None
+    header_line_idx = None
+    matched_lines = []
+    
+    # Find header line and column indices for DropPkts and DropOctets
+    for idx, line in enumerate(lines):
+        stripped = line.strip()
+        if not stripped:
+            continue
+        parts = stripped.split()
+        parts_lower = [p.lower() for p in parts]
+        
+        # Look for header containing DropPkts and/or DropOctets
+        if "droppkts" in parts_lower or "dropoctets" in parts_lower:
+            try:
+                if "droppkts" in parts_lower:
+                    drop_pkts_col_idx = parts_lower.index("droppkts")
+                if "dropoctets" in parts_lower:
+                    drop_octets_col_idx = parts_lower.index("dropoctets")
+                header_line = stripped
+                header_line_idx = idx
+                break
+            except ValueError:
+                continue
+    
+    # Parse data rows (after header)
+    # Only match: header line, port lines, VOQ lines, and Egress queue lines
+    if header_line_idx is not None:
+        start_idx = header_line_idx + 1
+        # Determine the maximum column index we need to check
+        max_col_idx = max(
+            drop_pkts_col_idx if drop_pkts_col_idx is not None else -1,
+            drop_octets_col_idx if drop_octets_col_idx is not None else -1
+        )
+        
+        for line in lines[start_idx:]:
+            stripped = line.strip()
+            if not stripped:
+                continue
+            # Skip separator lines (lines with only dashes)
+            if stripped.replace("-", "").strip() == "":
+                continue
+            
+            parts = stripped.split()
+            
+            # Match VOQ lines (start with "VOQ") - check first to avoid being misidentified as port lines
+            is_voq_line = stripped.startswith("VOQ")
+            
+            # Match Egress queue lines (precise match: must contain "Egress queue" string
+            # and have enough columns to contain DropPkts/DropOctets)
+            is_egress_queue_line = False
+            if "egress queue" in stripped.lower() and len(parts) > max_col_idx:
+                is_egress_queue_line = True
+            
+            # Match port lines (e.g., "Et12/1/1            TC0")
+            # Port lines typically have 2-3 columns: port name and TC class
+            # They don't have enough columns for DropPkts/DropOctets
+            # Only match if not VOQ or Egress queue line
+            if not (is_voq_line or is_egress_queue_line):
+                if len(parts) <= max_col_idx:
+                    # This could be a port line - check if it looks like one
+                    # Port lines usually start with interface names (Et, Ma, etc.) and have TC class
+                    if len(parts) >= 2 and len(parts) <= 3:
+                        # Record port lines (they provide context)
+                        matched_lines.append(stripped)
+                continue
+            
+            # Only process VOQ lines and Egress queue lines
+            if not (is_voq_line or is_egress_queue_line):
+                continue
+            
+            # Adjust column indices based on line type
+            # VOQ lines don't have Port and Class columns, so indices need to be adjusted
+            if is_voq_line:
+                # VOQ lines: DropPkts and DropOctets indices are 1 less than header
+                # (Header: Port, Class, EnqPkts, EnqOctets, DropPkts, DropOctets)
+                # (VOQ: VOQ, EnqPkts, EnqOctets, DropPkts, DropOctets)
+                actual_drop_pkts_idx = drop_pkts_col_idx - 1 if drop_pkts_col_idx is not None else None
+                actual_drop_octets_idx = drop_octets_col_idx - 1 if drop_octets_col_idx is not None else None
+            else:
+                # Egress queue lines: use original indices
+                actual_drop_pkts_idx = drop_pkts_col_idx
+                actual_drop_octets_idx = drop_octets_col_idx
+            
+            # Check DropPkts column
+            drop_pkts_non_zero = False
+            if actual_drop_pkts_idx is not None and len(parts) > actual_drop_pkts_idx:
+                try:
+                    drop_pkts_val = int(parts[actual_drop_pkts_idx].replace(",", ""))
+                    if drop_pkts_val != 0:
+                        drop_pkts_non_zero = True
+                except (ValueError, IndexError):
+                    # Cannot parse - skip this line
+                    continue
+            
+            # Check DropOctets column
+            drop_octets_non_zero = False
+            if actual_drop_octets_idx is not None and len(parts) > actual_drop_octets_idx:
+                try:
+                    drop_octets_val = int(parts[actual_drop_octets_idx].replace(",", ""))
+                    if drop_octets_val != 0:
+                        drop_octets_non_zero = True
+                except (ValueError, IndexError):
+                    # Cannot parse - skip this line
+                    continue
+            
+            # Record VOQ/Egress queue lines only if either column has non-zero value
+            if drop_pkts_non_zero or drop_octets_non_zero:
+                matched_lines.append(stripped)
+    
+    return header_line, matched_lines
 
 
 @register_check
@@ -1440,14 +1794,24 @@ class InterfaceQueueDropsCheck(BaseCheck):
                     summary="show interfaces counters queue drops output not found.",
                 )
             ]
-        lines = [l for l in blocks[0].lines if l.strip()]
-        if len(lines) > 0:
+        lines = blocks[0].lines
+        header_line, matched_lines = _parse_queue_drops_output(lines)
+        
+        if matched_lines or (header_line and len([l for l in lines if l.strip()]) > 1):
+            # Store header and matched lines for debug output
+            debug_info = []
+            if header_line:
+                debug_info.append(header_line)
+            debug_info.extend(matched_lines)
+            
             return [
                 CheckResult(
                     name=self.name,
                     category=self.category,
                     severity=Severity.WARN,
-                    summary="Queue drops present in interface counters.",
+                    summary=f"Queue drops present in interface counters ({len(matched_lines)} non-zero entry/ies).",
+                    details=debug_info,
+                    command="show interfaces counters queue drops",
                 )
             ]
         return [
@@ -1477,20 +1841,98 @@ class CpuQueueDropsCheck(BaseCheck):
                     summary="show cpu counters queue output not found.",
                 )
             ]
-        lines = [l for l in blocks[0].lines if l.strip()]
-        offenders = []
-        for line in lines:
-            if "|" in line:
-                parts = [p.strip() for p in line.split("|") if p.strip()]
+        lines = blocks[0].lines
+        drop_pkts_col_idx = None
+        drop_octets_col_idx = None
+        header_line_idx = None
+        
+        # Find header line and DropPkts column index
+        for idx, line in enumerate(lines):
+            stripped = line.strip()
+            if not stripped:
+                continue
+            # Handle both pipe-separated and space-separated headers
+            if "|" in stripped:
+                parts = [p.strip() for p in stripped.split("|") if p.strip()]
             else:
-                parts = line.split()
-            for tok in reversed(parts):
-                tok_clean = tok.replace(",", "").strip()
-                if tok_clean.isdigit():
-                    val = int(tok_clean)
-                    if val > 1_000_000:
-                        offenders.append((line.strip(), val))
-                    break
+                parts = stripped.split()
+            parts_lower = [p.lower() for p in parts]
+            
+            # Look for header containing DropPkts and DropOctets (exact match)
+            # Check for exact "droppkts" and "dropoctets" to ensure we get the right column
+            temp_drop_pkts_idx = None
+            temp_drop_octets_idx = None
+            
+            for col_idx, col_name in enumerate(parts_lower):
+                # Exact match for "droppkts" (case-insensitive)
+                if col_name == "droppkts":
+                    temp_drop_pkts_idx = col_idx
+                # Also find DropOctets for validation
+                if col_name == "dropoctets":
+                    temp_drop_octets_idx = col_idx
+            
+            # Check if header has "CoPP" and "Class" as separate columns
+            # If so, data rows will have one less column (CoPP Class merged)
+            header_cols_adjustment = 0
+            if "copp" in parts_lower and "class" in parts_lower:
+                copp_idx = parts_lower.index("copp")
+                class_idx = parts_lower.index("class")
+                # If CoPP and Class are adjacent, data rows will merge them
+                if class_idx == copp_idx + 1:
+                    header_cols_adjustment = 1
+            
+            # Validate: DropPkts should come before DropOctets in standard format
+            # If both found and DropPkts comes after DropOctets, the header might be reversed
+            if temp_drop_pkts_idx is not None:
+                # Adjust column index for data rows (subtract adjustment if CoPP/Class are merged)
+                drop_pkts_col_idx = temp_drop_pkts_idx - header_cols_adjustment
+                drop_octets_col_idx = temp_drop_octets_idx - header_cols_adjustment if temp_drop_octets_idx is not None else None
+                header_line_idx = idx
+                break
+        
+        if drop_pkts_col_idx is None:
+            # Fallback: if no header found, return OK
+            return [
+                CheckResult(
+                    name=self.name,
+                    category=self.category,
+                    severity=Severity.OK,
+                    summary="No DropPkts column found in output.",
+                )
+            ]
+        
+        # Parse data rows (after header)
+        offenders = []
+        start_idx = header_line_idx + 1 if header_line_idx is not None else 0
+        
+        for line in lines[start_idx:]:
+            stripped = line.strip()
+            if not stripped:
+                continue
+            # Skip separator lines
+            if stripped.replace("-", "").replace("|", "").strip() == "":
+                continue
+            
+            # Parse line (handle both pipe-separated and space-separated)
+            if "|" in stripped:
+                parts = [p.strip() for p in stripped.split("|") if p.strip()]
+            else:
+                parts = stripped.split()
+            
+            # Check DropPkts column
+            # Ensure we have enough columns and the DropPkts column exists
+            if len(parts) > drop_pkts_col_idx:
+                try:
+                    drop_pkts_val_str = parts[drop_pkts_col_idx].replace(",", "").strip()
+                    drop_pkts_val = int(drop_pkts_val_str)
+                    # Only match if DropPkts > 1000000 (1 million)
+                    # Note: We check DropPkts column specifically, not DropOctets
+                    if drop_pkts_val > 1_000_000:
+                        offenders.append((stripped, drop_pkts_val))
+                except (ValueError, IndexError):
+                    # Cannot parse - skip this line
+                    continue
+        
         if offenders:
             return [
                 CheckResult(
@@ -1498,7 +1940,7 @@ class CpuQueueDropsCheck(BaseCheck):
                     category=self.category,
                     severity=Severity.WARN,
                     summary=f"CPU queue drops exceed 1 million on {len(offenders)} entry(ies).",
-                    details=[f"{ln} (drops={v})" for ln, v in offenders],
+                    details=[f"{ln} (DropPkts={v})" for ln, v in offenders],
                 )
             ]
         return [
@@ -1622,46 +2064,119 @@ class HardwareCounterDropCheck(BaseCheck):
                 )
             ]
 
-        # Try to parse date from show clock (first tokenized date)
+        # Try to parse date from show clock
         clock = ctx.system_time
         drop_same_day = False
+        has_adverse_drops = False
+        has_congestion_drops = False
+        adverse_row_count = 0
+        congestion_row_count = 0
+        
         try:
             # Example: Thu Jan 29 23:10:00 2026
             dt_clock = _dt.datetime.strptime(clock, "%a %b %d %H:%M:%S %Y")
             date_clock = dt_clock.date()
+            
+            # Check Summary section for total counts
+            summary_match_a = re.search(r"Total\s+Adverse\s*\(A\)\s*Drops:\s*(\d+)", text, re.IGNORECASE)
+            summary_match_c = re.search(r"Total\s+Congestion\s*\(C\)\s*Drops:\s*(\d+)", text, re.IGNORECASE)
+            
+            if summary_match_a:
+                try:
+                    adverse_count = int(summary_match_a.group(1))
+                    has_adverse_drops = adverse_count > 0
+                except (ValueError, IndexError):
+                    pass
+            
+            if summary_match_c:
+                try:
+                    congestion_count = int(summary_match_c.group(1))
+                    has_congestion_drops = congestion_count > 0
+                except (ValueError, IndexError):
+                    pass
+            
+            # Check data rows for A or C type drops with Last Occurrence on same day
+            # Data row format: Type  Chip         CounterName  :  Count : First Occurrence : Last Occurrence
+            # Example: A     Jericho4/2   DeqDeletePktCnt :  28 : 2026-01-07 15:53:42 : 2026-01-07 15:53:56
             for line in blocks[0].lines:
-                if "Last Occurrence" in line:
-                    # naive approach: use last 4 tokens as date/time/year
-                    parts = line.split()
-                    tail = " ".join(parts[-4:])
-                    try:
-                        dt_last = _dt.datetime.strptime(tail, "%b %d %H:%M:%S %Y")
-                        if dt_last.date() == date_clock:
-                            drop_same_day = True
-                            break
-                    except Exception:
-                        continue
-        except Exception:
-            LOG.debug("Failed to parse show clock time for hardware counter drop comparison.")
+                stripped = line.strip()
+                if not stripped:
+                    continue
+                # Skip header and separator lines
+                if "Last Occurrence" in stripped or stripped.replace("-", "").replace("|", "").strip() == "":
+                    continue
+                
+                # Check if line starts with A or C (Adverse or Congestion type)
+                if stripped.startswith("A "):
+                    adverse_row_count += 1
+                    # Parse the line to extract Last Occurrence date
+                    # Format: A     Chip   CounterName : Count : FirstOccurrence : LastOccurrence
+                    # Last Occurrence is typically the last date/time field
+                    parts = stripped.split()
+                    if len(parts) >= 6:
+                        # Try to find date pattern in the line (YYYY-MM-DD HH:MM:SS)
+                        # Look for pattern matching date format
+                        date_pattern = r"(\d{4}-\d{2}-\d{2}\s+\d{2}:\d{2}:\d{2})"
+                        matches = re.findall(date_pattern, stripped)
+                        if matches:
+                            # Last match should be Last Occurrence
+                            last_occurrence_str = matches[-1]
+                            try:
+                                dt_last = _dt.datetime.strptime(last_occurrence_str, "%Y-%m-%d %H:%M:%S")
+                                if dt_last.date() == date_clock:
+                                    drop_same_day = True
+                                    # Don't break, continue counting all rows
+                            except (ValueError, Exception):
+                                continue
+                elif stripped.startswith("C "):
+                    congestion_row_count += 1
+                    # Parse the line to extract Last Occurrence date
+                    parts = stripped.split()
+                    if len(parts) >= 6:
+                        date_pattern = r"(\d{4}-\d{2}-\d{2}\s+\d{2}:\d{2}:\d{2})"
+                        matches = re.findall(date_pattern, stripped)
+                        if matches:
+                            last_occurrence_str = matches[-1]
+                            try:
+                                dt_last = _dt.datetime.strptime(last_occurrence_str, "%Y-%m-%d %H:%M:%S")
+                                if dt_last.date() == date_clock:
+                                    drop_same_day = True
+                                    # Don't break, continue counting all rows
+                            except (ValueError, Exception):
+                                continue
+        except Exception as e:
+            LOG.debug(f"Failed to parse show clock time for hardware counter drop comparison: {e}")
 
-        if drop_same_day and (
-            re.search(r"Adverse\s*\(A\)\s*Drops", text)
-            or re.search(r"Congestion\s*\(C\)\s*Drops", text)
-        ):
+        # Alert if we have A or C drops AND at least one has Last Occurrence on same day
+        if drop_same_day and (has_adverse_drops or has_congestion_drops):
+            summary_parts = []
+            if has_adverse_drops:
+                summary_parts.append(f"A drops: {adverse_row_count} row(s)")
+            if has_congestion_drops:
+                summary_parts.append(f"C drops: {congestion_row_count} row(s)")
+            summary_suffix = f" ({', '.join(summary_parts)})" if summary_parts else ""
             return [
                 CheckResult(
                     name=self.name,
                     category=self.category,
                     severity=Severity.WARN,
-                    summary="Adverse (A) or Congestion (C) drops occurred on the same day as show clock.",
+                    summary=f"Adverse (A) or Congestion (C) drops occurred on the same day as show clock.{summary_suffix}",
                 )
             ]
+        
+        # Build OK summary with row counts
+        summary_parts = []
+        if adverse_row_count > 0:
+            summary_parts.append(f"A drops: {adverse_row_count} row(s)")
+        if congestion_row_count > 0:
+            summary_parts.append(f"C drops: {congestion_row_count} row(s)")
+        summary_suffix = f" ({', '.join(summary_parts)})" if summary_parts else ""
         return [
             CheckResult(
                 name=self.name,
                 category=self.category,
                 severity=Severity.OK,
-                summary="No Adverse/Congestion drops with last occurrence on current day.",
+                summary=f"No Adverse/Congestion drops with last occurrence on current day.{summary_suffix}",
             )
         ]
 
@@ -1734,17 +2249,107 @@ class SystemHealthStorageCheck(BaseCheck):
         lines = blocks[0].lines
         bad_status = []
         low_lifetime = []
-        for line in lines:
-            if "Status" in line:
-                m = re.search(r"Status\s*:\s*(\S+)", line)
-                if m and m.group(1).lower() != "ok":
-                    bad_status.append(line.strip())
-            if "Lifetime remaining" in line:
-                m = re.search(r"([0-9]+)\s*%", line)
-                if m:
-                    val = int(m.group(1))
-                    if val < 10:
-                        low_lifetime.append(line.strip())
+        
+        # Expected format: table with "Device Type", "Health Metric", "Value" columns
+        # Example:
+        # Device Type  Health Metric  Value
+        # ------ ----- ------------- ------
+        # flash: SMART Health status FAILED
+        
+        # Find header line to identify where data starts
+        header_line_idx = None
+        for idx, line in enumerate(lines):
+            stripped = line.strip()
+            if not stripped:
+                continue
+            stripped_lower = stripped.lower()
+            # Look for header line containing "device type", "health metric", and "value"
+            if "device" in stripped_lower and "type" in stripped_lower and \
+               "health" in stripped_lower and "metric" in stripped_lower and \
+               "value" in stripped_lower:
+                header_line_idx = idx
+                break
+        
+        # Parse data rows after header
+        if header_line_idx is not None:
+            start_idx = header_line_idx + 1
+            while start_idx < len(lines):
+                line = lines[start_idx]
+                stripped = line.strip()
+                if not stripped:
+                    start_idx += 1
+                    continue
+                # Skip separator lines (lines with only dashes)
+                if stripped.replace("-", "").replace("|", "").strip() == "":
+                    start_idx += 1
+                    continue
+                # Skip lines that look like headers
+                if "device" in stripped.lower() and "type" in stripped.lower() and \
+                   "health" in stripped.lower() and "metric" in stripped.lower():
+                    start_idx += 1
+                    continue
+                
+                # Parse data row
+                # Check the entire line for status and lifetime information
+                line_lower = stripped.lower()
+                
+                # Check for Status: look for "status" keyword and check if value is not "ok"
+                if "status" in line_lower:
+                    # Extract the status value
+                    # Pattern: "... status VALUE" or "... status: VALUE"
+                    # Try regex first to handle "status:" pattern
+                    status_match = re.search(r"status\s*:?\s*(\S+)", line_lower)
+                    if status_match:
+                        status_value = status_match.group(1).strip()
+                        if status_value.lower() != "ok":
+                            bad_status.append(stripped)
+                    else:
+                        # Fallback: use last token as value
+                        parts = stripped.split()
+                        if parts:
+                            value_str = parts[-1].strip()
+                            if value_str.lower() != "ok":
+                                bad_status.append(stripped)
+                
+                # Check for Lifetime remaining: look for "lifetime" and "remaining" keywords
+                if "lifetime" in line_lower and "remaining" in line_lower:
+                    # Extract percentage value from the line
+                    lifetime_match = re.search(r"(\d+)\s*%", stripped)
+                    if lifetime_match:
+                        try:
+                            lifetime_val = int(lifetime_match.group(1))
+                            if lifetime_val < 10:
+                                low_lifetime.append(stripped)
+                        except (ValueError, IndexError):
+                            pass
+                
+                start_idx += 1
+        else:
+            # Fallback: parse non-table format
+            # Look for "Status:" and "Lifetime remaining:" patterns
+            for line in lines:
+                stripped = line.strip()
+                if not stripped:
+                    continue
+                
+                # Check for Status (case-insensitive, flexible format)
+                status_match = re.search(r"Status\s*:\s*(\S+)", stripped, re.IGNORECASE)
+                if status_match:
+                    status_value = status_match.group(1).strip()
+                    if status_value.lower() != "ok":
+                        bad_status.append(stripped)
+                
+                # Check for Lifetime remaining (flexible format)
+                if "lifetime" in stripped.lower() and "remaining" in stripped.lower():
+                    lifetime_match = re.search(r"(\d+)\s*%", stripped)
+                    if lifetime_match:
+                        try:
+                            lifetime_val = int(lifetime_match.group(1))
+                            if lifetime_val < 10:
+                                low_lifetime.append(stripped)
+                        except (ValueError, IndexError):
+                            continue
+        
         sev = Severity.OK
         details: List[str] = []
         if bad_status:
@@ -1753,10 +2358,13 @@ class SystemHealthStorageCheck(BaseCheck):
         if low_lifetime:
             sev = Severity.WARN
             details.extend(f"Low lifetime: {l}" for l in low_lifetime)
+        
         if sev == Severity.OK:
             summary = "All storage status Ok and lifetime remaining >= 10%."
         else:
             summary = "Storage issues detected (status not Ok or lifetime < 10%)."
+        
+        _maybe_add_debug_raw(details, "show system health storage", lines)
         return [
             CheckResult(
                 name=self.name,
@@ -1856,11 +2464,39 @@ class ScdSatelliteRetryErrCheck(BaseCheck):
         ]
 
 
+# Platform-specific configurable patterns for running-config checks
+# To add/modify/delete patterns, simply edit the corresponding platform list without changing the core logic
+# Format: {platform_series: [list of patterns to check]}
+RUNNING_CONFIG_PATTERNS_BY_PLATFORM = {
+    "78xx": [
+        "ip hardware fib next-hop arp dedicated",
+        # Add more patterns for 78xx here as needed
+        # Example: "another pattern to check for 78xx",
+    ],
+    "75xx": [
+        # Add patterns for 75xx here as needed
+        # Example: "pattern for 75xx",
+    ],
+    "7368": [
+        # Add patterns for 7368 here as needed
+        # Example: "pattern for 7368",
+    ],
+    "7289": [
+        # Add patterns for 7289 here as needed
+        # Example: "pattern for 7289",
+    ],
+    # Add more platforms as needed
+    # "other": [
+    #     "pattern for other platforms",
+    # ],
+}
+
+
 @register_check
 class RunningConfigCheck(BaseCheck):
-    name = "running_config_78xx_special"
+    name = "running_config_check"
     category = "config"
-    supported_platforms = ("78xx",)
+    supported_platforms = ("all",)  # Support all platforms, but check patterns based on detected platform
 
     def run(self, ctx: TechSupportContext) -> List[CheckResult]:
         blocks = ctx.get_blocks("show running-config sanitized")
@@ -1873,23 +2509,55 @@ class RunningConfigCheck(BaseCheck):
                     summary="show running-config sanitized output not found.",
                 )
             ]
-        pattern = "ip hardware fib next-hop arp dedicated"
-        found = any(pattern in line for line in blocks[0].lines)
-        if found:
+        
+        # Get patterns for the detected platform
+        platform_series = ctx.platform_series
+        patterns = RUNNING_CONFIG_PATTERNS_BY_PLATFORM.get(platform_series, [])
+        
+        # If no patterns configured for this platform, skip the check
+        if not patterns:
+            return [
+                CheckResult(
+                    name=self.name,
+                    category=self.category,
+                    severity=Severity.INFO,
+                    summary=f"No configuration patterns configured for platform {platform_series}.",
+                )
+            ]
+        
+        lines = blocks[0].lines
+        matched_lines = []
+        matched_patterns = []
+        
+        # Check each pattern against all lines
+        for pattern in patterns:
+            for line in lines:
+                if pattern in line:
+                    matched_lines.append(line.strip())
+                    if pattern not in matched_patterns:
+                        matched_patterns.append(pattern)
+                    break  # Only record first match per pattern
+        
+        if matched_patterns:
+            # Store matched lines in details for debug output
+            details = matched_lines.copy()
+            pattern_list = ", ".join(f"'{p}'" for p in matched_patterns)
             return [
                 CheckResult(
                     name=self.name,
                     category=self.category,
                     severity=Severity.WARN,
-                    summary="Found 'ip hardware fib next-hop arp dedicated' in running-config on 78xx.",
+                    summary=f"Found matching configuration pattern(s) on {platform_series}: {pattern_list}.",
+                    details=details,
                 )
             ]
+        
         return [
             CheckResult(
                 name=self.name,
                 category=self.category,
                 severity=Severity.OK,
-                summary="No 'ip hardware fib next-hop arp dedicated' config on 78xx.",
+                summary=f"No matching configuration patterns found on {platform_series}.",
             )
         ]
 
@@ -1903,6 +2571,7 @@ def run_all_checks(ctx: TechSupportContext) -> List[CheckResult]:
     populate_hostname_from_running_config(ctx)
     # Platform series based on parsed model for later checks
     ctx.platform_series = infer_platform_series(ctx.hw_model)
+    LOG.debug("Detected platform series: %s (from model: %s)", ctx.platform_series, ctx.hw_model)
     # Run registered checks based on platform
     for check in REGISTERED_CHECKS:
         if not platform_supported(check, ctx.platform_series):
@@ -1912,6 +2581,7 @@ def run_all_checks(ctx: TechSupportContext) -> List[CheckResult]:
             continue
         try:
             check_results = check.run(ctx) or []
+            LOG.debug("Check %s returned %d result(s)", check.name, len(check_results))
             results.extend(check_results)
         except Exception as exc:  # defensive
             LOG.exception("Check %s failed: %s", check.name, exc)
@@ -1956,6 +2626,51 @@ def make_device_brief(ctx: TechSupportContext, results: Sequence[CheckResult]) -
 # ---------------------------------------------------------------------------
 # Reporting
 # ---------------------------------------------------------------------------
+
+
+def format_checks_list() -> str:
+    """Format a list of all registered checks."""
+    lines: List[str] = []
+    lines.append("Supported Health Checks:")
+    lines.append("=" * 80)
+    
+    # Group checks by category
+    checks_by_category: Dict[str, List[BaseCheck]] = {}
+    for check in REGISTERED_CHECKS:
+        category = check.category
+        if category not in checks_by_category:
+            checks_by_category[category] = []
+        checks_by_category[category].append(check)
+    
+    # Sort categories
+    sorted_categories = sorted(checks_by_category.keys())
+    
+    for category in sorted_categories:
+        lines.append("")
+        lines.append(f"Category: {category}")
+        lines.append("-" * 80)
+        
+        checks = checks_by_category[category]
+        # Sort checks by name
+        checks.sort(key=lambda c: c.name)
+        
+        headers = ["Check Name", "Command", "Supported Platforms"]
+        rows: List[List[str]] = []
+        
+        for check in checks:
+            cmd = _infer_command_from_check(
+                CheckResult(name=check.name, category=check.category, severity=Severity.OK, summary="")
+            ) or "N/A"
+            platforms = ", ".join(check.supported_platforms) if check.supported_platforms else "all"
+            rows.append([check.name, cmd, platforms])
+        
+        # Compute column widths
+        widths = _compute_col_widths(headers, rows)
+        lines.extend(_ascii_table_with_widths(headers, rows, widths))
+    
+    lines.append("")
+    lines.append("=" * 80)
+    return "\n".join(lines)
 
 
 def _compute_col_widths(headers: Sequence[str], rows: Sequence[Sequence[str]]) -> List[int]:
@@ -2003,11 +2718,46 @@ def _ascii_table(headers: Sequence[str], rows: Sequence[Sequence[str]]) -> List[
     return _ascii_table_with_widths(headers, rows, widths)
 
 
+def _infer_command_from_check(check: CheckResult) -> Optional[str]:
+    """Infer command name from check name/category for debug output."""
+    # Map check names to their corresponding commands
+    name_to_cmd = {
+        "cooling_status": "show system env cooling",
+        "temperature_status": "show system env temperature",
+        "core_dump_files": "bash ls -ltr /var/core",
+        "flash_usage": "bash df -h",
+        "extensions_detail": "show extensions detail",
+        "cpu_usage_top": "show processes top once",
+        "memory_usage_top": "show processes top memory once",
+        "module_uptime": "show module",
+        "platform_sand_health": "show platform sand health",
+        "fap_fabric_serdes": "show platform fap fabric detail",
+        "redundancy_status": "show redundancy status",
+        "pci_errors": "show pci",
+        "agent_crash_logs": "show agent logs crash",
+        "power_input_voltage": "show system environment power detail",
+        "logging_threshold_errors": "show logging threshold errors",
+        "interfaces_queue_drops": "show interfaces counters queue drops",
+        "cpu_queue_drops": "show cpu counters queue",
+        "interfaces_discards": "show interfaces counters discards",
+        "interfaces_errors": "show interfaces counters errors",
+        "hardware_counter_drop": "show hardware counter drop",
+        "hardware_capacity": "show hardware capacity",
+        "system_health_storage": "show system health storage",
+        "hardware_fpga_error": "show hardware fpga error",
+        "scd_satellite_retry_error": "show platform scd satellite debug",
+        "running_config_check": "show running-config sanitized",
+    }
+    return name_to_cmd.get(check.name)
+
+
 def format_human_report(
     ctx: TechSupportContext,
     brief: DeviceBrief,
     results: Sequence[CheckResult],
     mode: str,
+    debug: bool = False,
+    show_checks_in_brief: Optional[List[str]] = None,
 ) -> str:
     lines: List[str] = []
     lines.append(f"Source: {ctx.source_id}")
@@ -2028,36 +2778,447 @@ def format_human_report(
         ],
     ]
 
+    # Brief table is always the same regardless of mode
+    widths = _compute_col_widths(headers, brief_rows)
+    lines.extend(_ascii_table_with_widths(headers, brief_rows, widths))
+    
+    # Add checks information in brief mode if requested
+    if mode == "brief" and show_checks_in_brief is not None:
+        lines.append("")
+        if len(show_checks_in_brief) == 0:
+            # No check names specified: show all supported checks list
+            lines.append(format_checks_list())
+        else:
+            # Show specified checks details
+            lines.append("Selected Checks Details:")
+            lines.append("=" * 80)
+            for check_name in show_checks_in_brief:
+                # Find the check result
+                check_result = None
+                for r in results:
+                    if r.name == check_name:
+                        check_result = r
+                        break
+                
+                if check_result:
+                    lines.append("")
+                    lines.append(f"Check: {check_result.category}/{check_result.name}")
+                    lines.append(f"Status: {check_result.severity.value}")
+                    lines.append(f"Summary: {check_result.summary}")
+                    if check_result.details:
+                        lines.append("Details:")
+                        for detail in check_result.details[:5]:  # Limit to first 5 details
+                            if not detail.startswith("[DEBUG"):
+                                lines.append(f"  {detail}")
+                        if len(check_result.details) > 5:
+                            lines.append(f"  ... and {len(check_result.details) - 5} more item(s)")
+                    lines.append("-" * 80)
+                else:
+                    lines.append("")
+                    lines.append(f"Check: {check_name} (not found or not executed)")
+                    lines.append("-" * 80)
+    
     if mode == "brief":
-        # Only brief table; widths based on brief rows.
-        widths = _compute_col_widths(headers, brief_rows)
-        lines.extend(_ascii_table_with_widths(headers, brief_rows, widths))
         return "\n".join(lines)
 
-    # verbose: build detail rows and ensure both tables share same widths
-    detail_rows: List[List[str]] = []
-    for r in results:
-        detail_rows.append(
-            [
-                r.severity.value,
-                f"{r.category}/{r.name}",
-                r.summary,
-                "",
-            ]
-        )
-        for d in r.details:
-            detail_rows.append(["", "", "", d])
-
-    all_rows = brief_rows + detail_rows
-    widths = _compute_col_widths(headers, all_rows)
-
-    # Brief table
-    lines.extend(_ascii_table_with_widths(headers, brief_rows, widths))
+    # verbose/debug: detailed checks with horizontal separators
     lines.append("")
     lines.append("Detailed checks:")
-    # Detailed table with identical column widths
-    if detail_rows:
-        lines.extend(_ascii_table_with_widths(headers, detail_rows, widths))
+    lines.append("-" * 80)
+    
+    for r in results:
+        lines.append(f"[{r.severity.value}] {r.category}/{r.name}: {r.summary}")
+        
+        # In verbose mode, limit details to avoid excessive output
+        # Show only summary and important lines (max 10 details)
+        if mode == "verbose" and not debug:
+            max_details = 10
+            filtered_details = [d for d in r.details if not d.startswith("[DEBUG raw")]
+            if len(filtered_details) > max_details:
+                for d in filtered_details[:max_details]:
+                    lines.append(f"  {d}")
+                lines.append(f"  ... and {len(filtered_details) - max_details} more item(s)")
+            else:
+                for d in filtered_details:
+                    lines.append(f"  {d}")
+        elif debug:
+            # In debug mode, show all details (except legacy debug raw)
+            for d in r.details:
+                if not d.startswith("[DEBUG raw"):
+                    lines.append(f"  {d}")
+        
+        # In debug mode, output full raw command output (not truncated)
+        # Exception: fap_fabric_serdes outputs filtered lines matching regex pattern
+        if debug:
+            cmd = r.command or _infer_command_from_check(r)
+            if cmd:
+                blocks = ctx.get_blocks(cmd)
+                if blocks:
+                    raw_lines = blocks[0].lines
+                    lines.append("")
+                    if r.name == "fap_fabric_serdes":
+                        # Special case: output only lines matching the regex pattern
+                        text = "\n".join(raw_lines)
+                        if ctx.platform_series == "78xx":
+                            # Pattern: U--- Ramon|---U Ramon|I--- Ramon|I---I Ramon|---I Ramon|\|--- Ramon|---\| Ramon
+                            # Note: I---I Ramon is also a valid pattern (I---I followed by Ramon without space)
+                            pattern = r"(U--- Ramon|[|]---U Ramon|I---I? Ramon|[|]---I Ramon|[|]--- Ramon|---[|] Ramon)"
+                        else:
+                            # Pattern: U--- Fe|---U Fe|I--- Fe|I---I Fe|---I Fe|\|--- Fe|---\| Fe
+                            # Note: I---I Fe is also a valid pattern (I---I followed by Fe without space)
+                            pattern = r"(U--- Fe|[|]---U Fe|I---I? Fe|[|]---I Fe|[|]--- Fe|---[|] Fe)"
+                        
+                        # Find matching lines (all lines in debug mode, no limit)
+                        matching_lines = []
+                        for line in raw_lines:
+                            if re.search(pattern, line):
+                                matching_lines.append(line)
+                        
+                        lines.append(f"[DEBUG filtered {cmd}]")
+                        lines.append("-" * 80)
+                        if matching_lines:
+                            for line in matching_lines:
+                                lines.append(line)
+                        else:
+                            lines.append("(No lines matched the pattern)")
+                        lines.append("-" * 80)
+                    elif r.name == "logging_threshold_errors":
+                        # Special case: output only lines matching configured regex patterns
+                        # Use shared patterns list (same as in LoggingThresholdErrorsCheck)
+                        patterns = LOGGING_THRESHOLD_ERROR_PATTERNS
+                        matching_lines = []
+                        for line in raw_lines:
+                            for pattern in patterns:
+                                if re.search(pattern, line, re.IGNORECASE):
+                                    matching_lines.append(line)
+                                    break  # Only add line once
+                        lines.append(f"[DEBUG filtered {cmd}]")
+                        lines.append("-" * 80)
+                        if matching_lines:
+                            for line in matching_lines:
+                                lines.append(line)
+                        else:
+                            lines.append("(No lines matched the patterns)")
+                        lines.append("-" * 80)
+                    elif r.name == "interfaces_queue_drops":
+                        # Special case: output only header and non-zero drop lines
+                        # Details already contain header + non-zero lines from check
+                        if r.details:
+                            lines.append(f"[DEBUG filtered {cmd}]")
+                            lines.append("-" * 80)
+                            for detail_line in r.details:
+                                lines.append(detail_line)
+                            lines.append("-" * 80)
+                        else:
+                            # Fallback: use shared parsing function
+                            header_line, matched_lines = _parse_queue_drops_output(raw_lines)
+                            lines.append(f"[DEBUG filtered {cmd}]")
+                            lines.append("-" * 80)
+                            if header_line:
+                                lines.append(header_line)
+                            if matched_lines:
+                                for line in matched_lines:
+                                    lines.append(line)
+                            else:
+                                lines.append("(No matched lines found)")
+                            lines.append("-" * 80)
+                    elif r.name == "interfaces_errors":
+                        # Special case: output only header and lines with non-zero error counters
+                        header_line = None
+                        header_line_idx = None
+                        non_zero_lines = []
+                        
+                        # Find header line
+                        for idx, line in enumerate(raw_lines):
+                            stripped = line.strip()
+                            if not stripped:
+                                continue
+                            # Skip separator lines
+                            if stripped.replace("-", "").replace("|", "").strip() == "":
+                                continue
+                            
+                            # Check if this looks like a header (contains common error counter names)
+                            parts = stripped.split()
+                            parts_lower = [p.lower() for p in parts]
+                            # Common error counter column names
+                            error_keywords = ["error", "crc", "alignment", "fcs", "frame", "overrun", "underrun", "collision"]
+                            if any(keyword in " ".join(parts_lower) for keyword in error_keywords):
+                                header_line = stripped
+                                header_line_idx = idx
+                                break
+                        
+                        # Parse data rows (after header)
+                        if header_line_idx is not None:
+                            start_idx = header_line_idx + 1
+                            for line in raw_lines[start_idx:]:
+                                stripped = line.strip()
+                                if not stripped:
+                                    continue
+                                # Skip separator lines
+                                if stripped.replace("-", "").replace("|", "").strip() == "":
+                                    continue
+                                
+                                parts = stripped.split()
+                                # Check if any numeric column (after interface name) is non-zero
+                                # Typically first column is interface name, rest are counters
+                                has_non_zero = False
+                                for i in range(1, len(parts)):  # Skip first column (interface name)
+                                    try:
+                                        val = int(parts[i].replace(",", "").strip())
+                                        if val != 0:
+                                            has_non_zero = True
+                                            break
+                                    except (ValueError, IndexError):
+                                        continue
+                                
+                                if has_non_zero:
+                                    non_zero_lines.append(stripped)
+                        
+                        lines.append(f"[DEBUG filtered {cmd}]")
+                        lines.append("-" * 80)
+                        if header_line:
+                            lines.append(header_line)
+                        if non_zero_lines:
+                            for line in non_zero_lines:
+                                lines.append(line)
+                        else:
+                            lines.append("(No non-zero error counters found)")
+                        lines.append("-" * 80)
+                    elif r.name == "hardware_counter_drop":
+                        # Special case: output only A (Adverse) and C (Congestion) type drop lines
+                        header_line = None
+                        header_line_idx = None
+                        filtered_lines = []
+                        
+                        # Find header line
+                        for idx, line in enumerate(raw_lines):
+                            stripped = line.strip()
+                            if not stripped:
+                                continue
+                            # Skip separator lines
+                            if stripped.replace("-", "").replace("|", "").strip() == "":
+                                continue
+                            
+                            # Check if this looks like a header (contains "Last Occurrence")
+                            if "Last Occurrence" in stripped:
+                                header_line = stripped
+                                header_line_idx = idx
+                                break
+                        
+                        # Also include Summary section if present
+                        summary_lines = []
+                        for line in raw_lines:
+                            stripped = line.strip()
+                            if not stripped:
+                                continue
+                            # Include Summary section
+                            if stripped.startswith("Summary:") or "Total Adverse" in stripped or "Total Congestion" in stripped:
+                                summary_lines.append(stripped)
+                        
+                        # Parse data rows (after header)
+                        if header_line_idx is not None:
+                            start_idx = header_line_idx + 1
+                            for line in raw_lines[start_idx:]:
+                                stripped = line.strip()
+                                if not stripped:
+                                    continue
+                                # Skip separator lines
+                                if stripped.replace("-", "").replace("|", "").strip() == "":
+                                    continue
+                                
+                                # Only include lines starting with A or C (Adverse or Congestion type)
+                                if stripped.startswith("A ") or stripped.startswith("C "):
+                                    filtered_lines.append(stripped)
+                        
+                        lines.append(f"[DEBUG filtered {cmd}]")
+                        lines.append("-" * 80)
+                        # Include Summary section if present
+                        if summary_lines:
+                            for line in summary_lines:
+                                lines.append(line)
+                            lines.append("")  # Empty line separator
+                        if header_line:
+                            lines.append(header_line)
+                        if filtered_lines:
+                            for line in filtered_lines:
+                                lines.append(line)
+                        else:
+                            lines.append("(No A or C type drops found)")
+                        lines.append("-" * 80)
+                    elif r.name == "hardware_capacity":
+                        # Special case: output only lines where "used entries" column is non-zero
+                        # Handle multi-line fixed-width headers where "Used" and "Entries" are on different lines
+                        header_lines = []
+                        used_entries_char_pos = None
+                        header_end_idx = None
+                        filtered_lines = []
+                        
+                        # Find header lines and align "Used" from first line with "Entries" from second line
+                        first_used_pos = None
+                        first_used_line_idx = None
+                        entries_line_idx = None
+                        
+                        # First pass: find the first line with "Used" and get its position
+                        for idx, line in enumerate(raw_lines):
+                            stripped = line.strip()
+                            if not stripped:
+                                continue
+                            
+                            parts_lower = [p.lower() for p in stripped.split()]
+                            # Look for line with "Used" (first header line)
+                            # Check for "Table" to identify the header line
+                            if "used" in parts_lower and "table" in parts_lower:
+                                # Find the first "Used" in the original line (not stripped)
+                                # This is the "Used Entries" column (first "Used", not second)
+                                used_pos = line.find("Used")
+                                if used_pos >= 0:
+                                    first_used_pos = used_pos
+                                    first_used_line_idx = idx
+                                    if stripped not in header_lines:
+                                        header_lines.append(stripped)
+                                    break
+                        
+                        # Second pass: find the line with "Entries" that aligns with first "Used"
+                        # If we found first_used_pos, try to align; otherwise just use first "Entries"
+                        for idx, line in enumerate(raw_lines):
+                            stripped = line.strip()
+                            if not stripped:
+                                continue
+                            
+                            # Look for line with "Entries" (second header line)
+                            # Use original line to find character positions
+                            if "Entries" in line:
+                                # Find all "Entries" positions in the original line
+                                entries_positions = []
+                                start = 0
+                                while True:
+                                    pos = line.find("Entries", start)
+                                    if pos < 0:
+                                        break
+                                    entries_positions.append(pos)
+                                    start = pos + 1
+                                
+                                if entries_positions:
+                                    # If we have first_used_pos, try to align
+                                    if first_used_pos is not None:
+                                        # Find the "Entries" closest to first_used_pos (within reasonable range)
+                                        # The first "Entries" should align with the first "Used"
+                                        best_pos = None
+                                        min_diff = float('inf')
+                                        for pos in entries_positions:
+                                            diff = abs(pos - first_used_pos)
+                                            if diff < min_diff and diff <= 10:
+                                                min_diff = diff
+                                                best_pos = pos
+                                        
+                                        # Set the position (use best aligned or first as fallback)
+                                        if best_pos is not None:
+                                            used_entries_char_pos = best_pos
+                                        else:
+                                            # If no good alignment, use first "Entries" as fallback
+                                            used_entries_char_pos = entries_positions[0]
+                                    else:
+                                        # If we didn't find first_used_pos, just use first "Entries"
+                                        used_entries_char_pos = entries_positions[0]
+                                    
+                                    entries_line_idx = idx
+                                    if stripped not in header_lines:
+                                        header_lines.append(stripped)
+                                    header_end_idx = idx
+                                    break
+                        
+                        # Parse data rows (after header)
+                        if header_end_idx is not None and used_entries_char_pos is not None:
+                            # Find the separator line after header
+                            start_idx = header_end_idx + 1
+                            # Skip separator lines (lines with only dashes or empty)
+                            while start_idx < len(raw_lines):
+                                line = raw_lines[start_idx]
+                                stripped = line.strip()
+                                if not stripped:
+                                    start_idx += 1
+                                    continue
+                                # Check if it's a separator line (mostly dashes)
+                                if stripped.replace("-", "").replace("|", "").strip() == "":
+                                    start_idx += 1
+                                    continue
+                                # Check if it looks like a data row (has alphanumeric content)
+                                if re.search(r'[A-Za-z0-9]', stripped):
+                                    break
+                                start_idx += 1
+                            
+                            for line in raw_lines[start_idx:]:
+                                # Use original line (not stripped) for fixed-width parsing
+                                stripped = line.strip()
+                                if not stripped:
+                                    continue
+                                # Skip separator lines
+                                if stripped.replace("-", "").replace("|", "").strip() == "":
+                                    continue
+                                # Skip lines that look like headers (contain "Table", "Entries", etc.)
+                                if any(keyword in stripped for keyword in ["Table", "Entries", "Feature", "Chip"]):
+                                    continue
+                                
+                                # Extract value at the "Entries" column position
+                                # Use fixed-width parsing: find the number at or near used_entries_char_pos
+                                # Use original line to maintain character positions
+                                if len(line) > used_entries_char_pos:
+                                    # Extract a substring around the column position (allow some flexibility)
+                                    start_pos = max(0, used_entries_char_pos - 5)
+                                    end_pos = min(len(line), used_entries_char_pos + 20)
+                                    col_substring = line[start_pos:end_pos].strip()
+                                    
+                                    # Try to find a number in this substring
+                                    # Look for the first number in this region
+                                    number_match = re.search(r'\b(\d+)\b', col_substring)
+                                    if number_match:
+                                        try:
+                                            used_val = int(number_match.group(1))
+                                            if used_val != 0:
+                                                # Store stripped version for output
+                                                filtered_lines.append(stripped)
+                                        except (ValueError, IndexError):
+                                            continue
+                        
+                        lines.append(f"[DEBUG filtered {cmd}]")
+                        lines.append("-" * 80)
+                        if header_lines:
+                            for header_line in header_lines:
+                                lines.append(header_line)
+                        if filtered_lines:
+                            for line in filtered_lines:
+                                lines.append(line)
+                        else:
+                            lines.append("(No lines with non-zero used entries found)")
+                        lines.append("-" * 80)
+                    elif r.name == "running_config_check":
+                        # Special case: output only lines matching configured patterns
+                        # Use platform-specific patterns list (same as in RunningConfigCheck)
+                        platform_series = ctx.platform_series
+                        patterns = RUNNING_CONFIG_PATTERNS_BY_PLATFORM.get(platform_series, [])
+                        matching_lines = []
+                        for line in raw_lines:
+                            for pattern in patterns:
+                                if pattern in line:
+                                    matching_lines.append(line)
+                                    break  # Only add line once
+                        lines.append(f"[DEBUG filtered {cmd}]")
+                        lines.append("-" * 80)
+                        if matching_lines:
+                            for line in matching_lines:
+                                lines.append(line)
+                        else:
+                            lines.append("(No lines matched the patterns)")
+                        lines.append("-" * 80)
+                    else:
+                        # Normal case: output full raw
+                        lines.append(f"[DEBUG raw {cmd}]")
+                        lines.append("-" * 80)
+                        for raw_line in raw_lines:
+                            lines.append(raw_line)
+                        lines.append("-" * 80)
+        
+        lines.append("-" * 80)
 
     return "\n".join(lines)
 
@@ -2100,7 +3261,7 @@ def format_json_report(
 # ---------------------------------------------------------------------------
 
 
-def process_showtech_text(source_id: str, text: str, mode: str, as_json: bool) -> str:
+def process_showtech_text(source_id: str, text: str, mode: str, as_json: bool, debug: bool = False, show_checks_in_brief: Optional[List[str]] = None) -> str:
     # Load into memory, parse, then drop raw text reference
     parser = TechSupportParser()
     blocks = parser.parse(text)
@@ -2113,12 +3274,23 @@ def process_showtech_text(source_id: str, text: str, mode: str, as_json: bool) -
     if as_json:
         return format_json_report(ctx, brief, results, mode)
     else:
-        return format_human_report(ctx, brief, results, mode)
+        return format_human_report(ctx, brief, results, mode, debug, show_checks_in_brief)
 
 
 def main(argv: Optional[Sequence[str]] = None) -> None:
     args = parse_args(argv)
     configure_logging(args.debug)
+
+    # Handle --list-checks option
+    if args.list_checks:
+        print(format_checks_list())
+        return
+
+    # Validate that paths are provided when not using --list-checks
+    if not args.paths:
+        import sys
+        print("error: the following arguments are required: PATH (unless using --list-checks)", file=sys.stderr)
+        sys.exit(2)
 
     outputs: List[str] = []
 
@@ -2139,7 +3311,7 @@ def main(argv: Optional[Sequence[str]] = None) -> None:
                 except OSError as exc:
                     LOG.error("Failed to read %s: %s", f, exc)
                     continue
-                report = process_showtech_text(str(f), text, args.mode, args.json)
+                report = process_showtech_text(str(f), text, args.mode, args.json, args.debug, args.show_checks_in_brief)
                 outputs.append(report)
         elif path.is_file():
             # Decide if archive or plain show-tech file
@@ -2167,7 +3339,7 @@ def main(argv: Optional[Sequence[str]] = None) -> None:
                         )
                         continue
                     report = process_showtech_text(
-                        f"{arch}!{spec.display_name}", text, args.mode, args.json
+                        f"{arch}!{spec.display_name}", text, args.mode, args.json, args.debug, args.show_checks_in_brief
                     )
                     outputs.append(report)
             else:
@@ -2177,7 +3349,7 @@ def main(argv: Optional[Sequence[str]] = None) -> None:
                 except OSError as exc:
                     LOG.error("Failed to read %s: %s", path, exc)
                     continue
-                report = process_showtech_text(str(path), text, args.mode, args.json)
+                report = process_showtech_text(str(path), text, args.mode, args.json, args.debug, args.show_checks_in_brief)
                 outputs.append(report)
         else:
             LOG.error("Path does not exist or is not accessible: %s", path)
