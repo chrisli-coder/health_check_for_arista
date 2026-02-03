@@ -2432,11 +2432,64 @@ class HardwareFpgaErrorCheck(BaseCheck):
             ]
         lines = blocks[0].lines
         offenders = []
-        for line in lines:
-            if "error" in line.lower():
-                m = re.search(r"([0-9]+)", line)
-                if m and int(m.group(1)) != 0:
-                    offenders.append(line.strip())
+        
+        # Find header line with "FPGA" and "Errors" to determine column position
+        errors_col_start = None
+        errors_col_end = None
+        
+        for i, line in enumerate(lines):
+            # Look for header line containing "FPGA" and "Errors"
+            if "FPGA" in line and "Errors" in line:
+                # Find the position of "Errors" word
+                errors_idx = line.find("Errors")
+                if errors_idx != -1:
+                    # The Errors column starts at the beginning of "Errors" word
+                    errors_col_start = errors_idx
+                    # Find the end position by looking for the next column header
+                    # "First Occurrence" comes after "Errors"
+                    first_occurrence_idx = line.find("First Occurrence", errors_idx)
+                    if first_occurrence_idx != -1:
+                        errors_col_end = first_occurrence_idx
+                    else:
+                        # Fallback: assume Errors column ends at "Last Occurrence"
+                        last_occurrence_idx = line.find("Last Occurrence", errors_idx)
+                        if last_occurrence_idx != -1:
+                            errors_col_end = last_occurrence_idx
+                        else:
+                            # Last resort: assume Errors column is about 12 characters wide
+                            errors_col_end = errors_idx + 12
+                    break
+        
+        # If we found the header, parse data rows
+        if errors_col_start is not None and errors_col_end is not None:
+            for line in lines:
+                # Skip header lines, separator lines, section headers, and empty lines
+                if (
+                    "FPGA" in line and "Errors" in line  # Header line
+                    or "---" in line  # Separator line
+                    or "Action:" in line  # Action line
+                    or "Uncorrected" in line or "Corrected" in line or "Software-repaired" in line  # Section headers
+                    or not line.strip()  # Empty line
+                ):
+                    continue
+                
+                # Extract the Errors column value using fixed-width parsing
+                if len(line) > errors_col_start:
+                    # Get the Errors column substring (from Errors start to First Occurrence start)
+                    errors_col_str = line[errors_col_start:errors_col_end].strip()
+                    
+                    # Extract the first number from this column (handles right-aligned numbers)
+                    # The number might be right-aligned, so we need to find it
+                    number_match = re.search(r'\d+', errors_col_str)
+                    if number_match:
+                        try:
+                            error_count = int(number_match.group(0))
+                            if error_count > 0:
+                                offenders.append(line.strip())
+                        except ValueError:
+                            # Not a valid number, skip this line
+                            continue
+        
         if offenders:
             return [
                 CheckResult(
