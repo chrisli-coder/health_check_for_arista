@@ -30,7 +30,7 @@ from typing import Dict, Iterable, List, Optional, Sequence, Tuple
 
 __author__ = "chris.li@arista.com"
 __company__ = "Arista Networks"
-__last_modified__ = "2026-01-30"
+__last_modified__ = "2026-02-03"
 __version__ = "1.0.0"
 
 
@@ -51,12 +51,22 @@ def build_arg_parser() -> argparse.ArgumentParser:
             "directories and archive files containing one or more bundles."
         ),
         formatter_class=argparse.RawTextHelpFormatter,
-    )
-    # Put author/company/version at the very end of help output via epilog.
-    parser.epilog = (
-        "Author  : %(author)s\n"
-        "Company : %(company)s\n"
-        "Version : %(version)s (Last modified: %(last)s)"
+        epilog=(
+            "Examples:\n"
+            "  %(prog)s /path/to/show-tech                    # Basic analysis\n"
+            "  %(prog)s -v /path/to/show-tech                 # Verbose mode\n"
+            "  %(prog)s -d /path/to/show-tech                # Debug mode\n"
+            "  %(prog)s -j -o report.json /path/to/show-tech  # JSON output\n"
+            "  %(prog)s -l                                   # List all checks\n"
+            "  %(prog)s -c memory_usage_top /path/to/show-tech  # Show specific check\n"
+            "  %(prog)s -s memory_usage_top /path/to/show-tech  # Skip specific check\n"
+            "  %(prog)s -S hardware /path/to/show-tech       # Skip entire category\n"
+            "  %(prog)s -s cpu_usage_top -S hardware /path/to/show-tech  # Combine options\n"
+            "\n"
+            "Author  : %(author)s\n"
+            "Company : %(company)s\n"
+            "Version : %(version)s (Last modified: %(last)s)"
+        ),
     )
 
     parser.add_argument(
@@ -91,6 +101,7 @@ def build_arg_parser() -> argparse.ArgumentParser:
         help="Brief report mode (default).",
     )
     output_group.add_argument(
+        "-j",
         "--json",
         action="store_true",
         help="Output report in JSON format.",
@@ -149,6 +160,7 @@ def build_arg_parser() -> argparse.ArgumentParser:
 def parse_args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
     parser = build_arg_parser()
     meta = {
+        "prog": parser.prog,
         "author": __author__,
         "company": __company__,
         "version": __version__,

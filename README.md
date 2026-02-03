@@ -4,7 +4,7 @@ A comprehensive health check tool for analyzing Arista EOS device show-tech file
 
 **Author**: chris.li@arista.com  
 **Company**: Arista Networks  
-**Last Modified**: 2026-01-30
+**Last Modified**: 2026-02-03
 
 ## Description
 
@@ -77,7 +77,7 @@ python3 health_check_eos.py file1 file2 directory1 archive.zip
 - `-b, --brief`: Brief report mode (default)
 - `-v, --verbose`: Verbose report mode (includes all check details)
 - `-d, --debug`: Enable debug logging and show full raw outputs
-- `--json`: Output report in JSON format
+- `-j, --json`: Output report in JSON format
 
 #### Output Control
 
@@ -106,38 +106,58 @@ python3 health_check_eos.py file1 file2 directory1 archive.zip
 ### Examples
 
 ```bash
+# Basic analysis (brief mode, default)
+python3 health_check_eos.py /path/to/show-tech
+
 # List all supported checks
+python3 health_check_eos.py -l
+# or
 python3 health_check_eos.py --list-checks
 
-# Brief mode with specific checks
-python3 health_check_eos.py -b -c memory_usage_top cpu_usage_top /path/to/show-tech
-
-# Verbose mode
+# Verbose mode with detailed output
 python3 health_check_eos.py -v /path/to/show-tech
+# or
+python3 health_check_eos.py --verbose /path/to/show-tech
 
-# Debug mode
+# Debug mode with full raw outputs
 python3 health_check_eos.py -d /path/to/show-tech
+# or
+python3 health_check_eos.py --debug /path/to/show-tech
 
-# JSON output
-python3 health_check_eos.py --json /path/to/show-tech -o report.json
+# JSON output to file
+python3 health_check_eos.py -j -o report.json /path/to/show-tech
+# or
+python3 health_check_eos.py --json --output report.json /path/to/show-tech
+
+# Show specific checks in brief mode
+python3 health_check_eos.py -c memory_usage_top cpu_usage_top /path/to/show-tech
+# or
+python3 health_check_eos.py --show-checks-in-brief memory_usage_top cpu_usage_top /path/to/show-tech
 
 # Show all checks list in brief mode
-python3 health_check_eos.py -b -c /path/to/show-tech
+python3 health_check_eos.py -c /path/to/show-tech
 
 # Skip specific checks
 python3 health_check_eos.py -s memory_usage_top cpu_usage_top /path/to/show-tech
-
-# Skip multiple checks
-python3 health_check_eos.py -s memory_usage_top cpu_usage_top interfaces_errors /path/to/show-tech
+# or
+python3 health_check_eos.py --skip-checks memory_usage_top cpu_usage_top /path/to/show-tech
 
 # Skip entire category
 python3 health_check_eos.py -S hardware /path/to/show-tech
+# or
+python3 health_check_eos.py --skip-categories hardware /path/to/show-tech
 
 # Skip multiple categories
 python3 health_check_eos.py -S hardware interface /path/to/show-tech
 
-# Combine skip checks and skip categories
+# Combine options: skip checks and categories
 python3 health_check_eos.py -s memory_usage_top -S hardware /path/to/show-tech
+
+# Analyze multiple files
+python3 health_check_eos.py file1 file2 directory1 archive.zip
+
+# Analyze archive file
+python3 health_check_eos.py /path/to/support-bundle.zip
 ```
 
 ## Health Checks
