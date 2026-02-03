@@ -31,7 +31,7 @@ from typing import Dict, Iterable, List, Optional, Sequence, Tuple
 __author__ = "chris.li@arista.com"
 __company__ = "Arista Networks"
 __last_modified__ = "2026-02-03"
-__version__ = "1.0.0"
+__version__ = "1.1.0"
 
 
 LOG = logging.getLogger("health_check_eos")
@@ -1220,11 +1220,71 @@ class ModuleUptimeCheck(BaseCheck):
                 )
             ]
         anomalous = []
-        for line in blocks[0].lines:
-            if not line.strip() or "Uptime" in line or "Module" in line:
-                continue
-            if "N/A" in line or "0 days" in line or "00:00" in line:
-                anomalous.append(line.strip())
+        lines = blocks[0].lines
+        
+        # Find the header line with "Status" and "Uptime" columns
+        status_col_start = None
+        uptime_col_start = None
+        uptime_col_end = None
+        header_found = False
+        header_line_idx = -1
+        
+        for i, line in enumerate(lines):
+            if "Status" in line and "Uptime" in line:
+                # Find column positions
+                status_idx = line.find("Status")
+                uptime_idx = line.find("Uptime")
+                if status_idx != -1 and uptime_idx != -1:
+                    status_col_start = status_idx
+                    uptime_col_start = uptime_idx
+                    # Find where Uptime column ends (look for "Power" or end of line)
+                    power_idx = line.find("Power", uptime_idx)
+                    if power_idx != -1:
+                        uptime_col_end = power_idx
+                    else:
+                        # Fallback: assume Uptime column is about 20 characters wide
+                        uptime_col_end = uptime_idx + 20
+                    header_found = True
+                    header_line_idx = i
+                    break
+        
+        # Normal status values
+        normal_statuses = {"Ok", "Active", "Standby"}
+        
+        # Only parse data rows after the Status/Uptime header is found
+        if header_found:
+            # Start parsing from the line after the separator line (usually header_line_idx + 2)
+            for i in range(header_line_idx + 2, len(lines)):
+                line = lines[i]
+                
+                # Skip empty lines and separator lines
+                if not line.strip() or "---" in line:
+                    continue
+                
+                # Stop if we hit another section header (like "MAC addresses")
+                if "MAC addresses" in line or ("Module" in line and "Ports" in line):
+                    break
+                
+                # Use fixed-width parsing
+                if len(line) > uptime_col_start:
+                    # Extract Status column
+                    status_str = line[status_col_start:uptime_col_start].strip()
+                    # Extract Uptime column
+                    uptime_str = line[uptime_col_start:uptime_col_end].strip()
+                    
+                    # Check if status is abnormal (not in normal_statuses)
+                    is_abnormal_status = status_str and status_str not in normal_statuses
+                    
+                    # Check if uptime is abnormal (N/A, 0 days, or 00:00)
+                    is_abnormal_uptime = (
+                        uptime_str == "N/A"
+                        or "0 days" in uptime_str
+                        or uptime_str.startswith("00:00")
+                        or (uptime_str and not re.search(r"\d+", uptime_str))  # No numbers at all
+                    )
+                    
+                    if is_abnormal_status or is_abnormal_uptime:
+                        anomalous.append(line.strip())
         if not anomalous:
             return [
                 CheckResult(
@@ -1359,11 +1419,29 @@ class RedundancyStatusCheck(BaseCheck):
             ]
         lines = blocks[0].lines
         active_unit1 = False
+        my_state_active = False
+        unit_id_1 = False
         op_proto = None
         cfg_proto = None
         for line in lines:
-            if "ACTIVE" in line and "unit 1" in line:
+            # Check for "my state = ACTIVE" or similar patterns
+            if "my state" in line.lower() and "ACTIVE" in line:
+                my_state_active = True
+            # Check for "Unit ID = 1" or similar patterns
+            if "unit id" in line.lower():
+                # Extract the unit ID value
+                m = re.search(r"unit\s+id\s*[=:]\s*(\d+)", line, re.IGNORECASE)
+                if m:
+                    unit_id = int(m.group(1))
+                    if unit_id == 1:
+                        unit_id_1 = True
+            # Also check for legacy format: "ACTIVE" and "unit 1" in same line
+            if "ACTIVE" in line and "unit 1" in line.lower():
                 active_unit1 = True
+        
+        # ACTIVE is on unit 1 if: (my state is ACTIVE AND unit ID is 1) OR legacy format matched
+        if (my_state_active and unit_id_1) or active_unit1:
+            active_unit1 = True
             # Match "Redundancy Protocol (Operational): <value>" or similar formats
             if "Redundancy Protocol (Operational)" in line:
                 # Try multiple formats: "key: value", "key = value", etc.
@@ -1393,6 +1471,7 @@ class RedundancyStatusCheck(BaseCheck):
                     category=self.category,
                     severity=Severity.OK,
                     summary="ACTIVE is on unit 1.",
+                    command="show redundancy status",
                 )
             )
         else:
@@ -1402,6 +1481,7 @@ class RedundancyStatusCheck(BaseCheck):
                     category=self.category,
                     severity=Severity.WARN,
                     summary="ACTIVE is not on unit 1.",
+                    command="show redundancy status",
                 )
             )
         if op_proto and cfg_proto:
@@ -1415,6 +1495,7 @@ class RedundancyStatusCheck(BaseCheck):
                         category=self.category,
                         severity=Severity.OK,
                         summary=f"Redundancy Protocol Operational and Configured both '{op_proto.strip()}'.",
+                        command="show redundancy status",
                     )
                 )
             else:
@@ -1427,6 +1508,7 @@ class RedundancyStatusCheck(BaseCheck):
                             "Redundancy Protocol mismatch: "
                             f"Operational='{op_proto.strip()}', Configured='{cfg_proto.strip()}'."
                         ),
+                        command="show redundancy status",
                     )
                 )
         elif op_proto or cfg_proto:
@@ -1440,6 +1522,7 @@ class RedundancyStatusCheck(BaseCheck):
                         f"Redundancy Protocol partially found: "
                         f"Operational='{op_proto or 'N/A'}', Configured='{cfg_proto or 'N/A'}'."
                     ),
+                    command="show redundancy status",
                 )
             )
         return results
@@ -1834,7 +1917,8 @@ class InterfaceQueueDropsCheck(BaseCheck):
         lines = blocks[0].lines
         header_line, matched_lines = _parse_queue_drops_output(lines)
         
-        if matched_lines or (header_line and len([l for l in lines if l.strip()]) > 1):
+        # Only report WARN if there are actual non-zero drop entries
+        if matched_lines:
             # Store header and matched lines for debug output
             debug_info = []
             if header_line:
@@ -2007,14 +2091,84 @@ class InterfaceDiscardsCheck(BaseCheck):
                     summary="show interfaces counters discards output not found.",
                 )
             ]
-        lines = [l for l in blocks[0].lines if l.strip()]
-        if lines:
+        lines = blocks[0].lines
+        
+        # Find header line to determine column positions
+        in_discards_col_idx = None
+        out_discards_col_idx = None
+        header_line_idx = None
+        
+        for idx, line in enumerate(lines):
+            stripped = line.strip()
+            if not stripped:
+                continue
+            parts = stripped.split()
+            parts_lower = [p.lower() for p in parts]
+            
+            # Look for header containing InDiscards and/or OutDiscards
+            if "indiscards" in parts_lower or "outdiscards" in parts_lower:
+                try:
+                    if "indiscards" in parts_lower:
+                        in_discards_col_idx = parts_lower.index("indiscards")
+                    if "outdiscards" in parts_lower:
+                        out_discards_col_idx = parts_lower.index("outdiscards")
+                    header_line_idx = idx
+                    break
+                except ValueError:
+                    continue
+        
+        # Check for non-zero discards in data rows
+        has_discards = False
+        discard_lines = []
+        
+        if header_line_idx is not None:
+            max_col_idx = max(
+                in_discards_col_idx if in_discards_col_idx is not None else -1,
+                out_discards_col_idx if out_discards_col_idx is not None else -1
+            )
+            
+            for line in lines[header_line_idx + 1:]:
+                stripped = line.strip()
+                if not stripped:
+                    continue
+                # Skip separator lines (lines with only dashes or similar)
+                if stripped.replace("-", "").replace(" ", "").strip() == "":
+                    continue
+                
+                parts = stripped.split()
+                if len(parts) <= max_col_idx:
+                    continue
+                
+                # Check InDiscards column
+                if in_discards_col_idx is not None and len(parts) > in_discards_col_idx:
+                    try:
+                        in_discards_val = int(parts[in_discards_col_idx].replace(",", ""))
+                        if in_discards_val > 0:
+                            has_discards = True
+                            discard_lines.append(stripped)
+                            continue
+                    except (ValueError, IndexError):
+                        pass
+                
+                # Check OutDiscards column
+                if out_discards_col_idx is not None and len(parts) > out_discards_col_idx:
+                    try:
+                        out_discards_val = int(parts[out_discards_col_idx].replace(",", ""))
+                        if out_discards_val > 0:
+                            has_discards = True
+                            discard_lines.append(stripped)
+                    except (ValueError, IndexError):
+                        pass
+        
+        if has_discards:
             return [
                 CheckResult(
                     name=self.name,
                     category=self.category,
                     severity=Severity.WARN,
-                    summary="Interface discards present.",
+                    summary=f"Interface discards present ({len(discard_lines)} interface(s) with non-zero discards).",
+                    details=discard_lines,
+                    command="show interfaces counters discards",
                 )
             ]
         return [
@@ -2023,6 +2177,7 @@ class InterfaceDiscardsCheck(BaseCheck):
                 category=self.category,
                 severity=Severity.OK,
                 summary="No interface discards present.",
+                command="show interfaces counters discards",
             )
         ]
 
@@ -2044,14 +2199,80 @@ class InterfaceErrorsCheck(BaseCheck):
                     summary="show interfaces counters errors output not found.",
                 )
             ]
-        lines = [l for l in blocks[0].lines if l.strip()]
-        if lines:
+        lines = blocks[0].lines
+        
+        # Find header line to determine column positions
+        # Error counter columns: FCS, Align, Symbol, Rx, Runts, Giants, Tx
+        error_column_names = ["fcs", "align", "symbol", "rx", "runts", "giants", "tx"]
+        error_col_indices = {}
+        header_line_idx = None
+        
+        for idx, line in enumerate(lines):
+            stripped = line.strip()
+            if not stripped:
+                continue
+            parts = stripped.split()
+            parts_lower = [p.lower() for p in parts]
+            
+            # Look for header containing error counter column names
+            found_columns = []
+            for col_name in error_column_names:
+                if col_name in parts_lower:
+                    found_columns.append(col_name)
+                    error_col_indices[col_name] = parts_lower.index(col_name)
+            
+            # If we found at least one error counter column, consider this the header
+            if found_columns:
+                header_line_idx = idx
+                break
+        
+        # Check for non-zero errors in data rows
+        has_errors = False
+        error_lines = []
+        
+        if header_line_idx is not None:
+            max_col_idx = max(error_col_indices.values()) if error_col_indices else -1
+            
+            for line in lines[header_line_idx + 1:]:
+                stripped = line.strip()
+                if not stripped:
+                    continue
+                # Skip separator lines (lines with only dashes or similar)
+                if stripped.replace("-", "").replace(" ", "").strip() == "":
+                    continue
+                # Skip the "(No non-zero error counters found)" message line
+                if "no non-zero" in stripped.lower() or "no error" in stripped.lower():
+                    continue
+                
+                parts = stripped.split()
+                if len(parts) <= max_col_idx:
+                    continue
+                
+                # Check all error counter columns
+                line_has_error = False
+                for col_name, col_idx in error_col_indices.items():
+                    if len(parts) > col_idx:
+                        try:
+                            error_val = int(parts[col_idx].replace(",", ""))
+                            if error_val > 0:
+                                line_has_error = True
+                                break
+                        except (ValueError, IndexError):
+                            pass
+                
+                if line_has_error:
+                    has_errors = True
+                    error_lines.append(stripped)
+        
+        if has_errors:
             return [
                 CheckResult(
                     name=self.name,
                     category=self.category,
                     severity=Severity.WARN,
-                    summary="Interface error counters present.",
+                    summary=f"Interface error counters present ({len(error_lines)} interface(s) with non-zero errors).",
+                    details=error_lines,
+                    command="show interfaces counters errors",
                 )
             ]
         return [
@@ -2060,6 +2281,7 @@ class InterfaceErrorsCheck(BaseCheck):
                 category=self.category,
                 severity=Severity.OK,
                 summary="No interface error counters present.",
+                command="show interfaces counters errors",
             )
         ]
 
@@ -2695,7 +2917,7 @@ class InventoryCheck(BaseCheck):
             CheckResult(
                 name=self.name,
                 category=self.category,
-                severity=Severity.OK,
+                severity=Severity.INFO,
                 summary=summary,
                 details=details,
             )
@@ -2998,16 +3220,21 @@ def format_human_report(
             
             # In verbose mode, limit details to avoid excessive output
             # Show only summary and important lines (max 10 details)
+            # Exception: inventory check should not show details in verbose mode
             if mode == "verbose" and not debug:
-                max_details = 10
-                filtered_details = [d for d in r.details if not d.startswith("[DEBUG raw")]
-                if len(filtered_details) > max_details:
-                    for d in filtered_details[:max_details]:
-                        lines.append(f"  {d}")
-                    lines.append(f"  ... and {len(filtered_details) - max_details} more item(s)")
+                if r.name == "inventory":
+                    # Skip details for inventory check in verbose mode
+                    pass
                 else:
-                    for d in filtered_details:
-                        lines.append(f"  {d}")
+                    max_details = 10
+                    filtered_details = [d for d in r.details if not d.startswith("[DEBUG raw")]
+                    if len(filtered_details) > max_details:
+                        for d in filtered_details[:max_details]:
+                            lines.append(f"  {d}")
+                        lines.append(f"  ... and {len(filtered_details) - max_details} more item(s)")
+                    else:
+                        for d in filtered_details:
+                            lines.append(f"  {d}")
             elif debug:
                 # In debug mode, show all details (except legacy debug raw)
                 for d in r.details:
