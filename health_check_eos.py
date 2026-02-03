@@ -30,7 +30,7 @@ from typing import Dict, Iterable, List, Optional, Sequence, Tuple
 
 __author__ = "chris.li@arista.com"
 __company__ = "Arista Networks"
-__last_modified__ = "2026-01-29"
+__last_modified__ = "2026-01-30"
 __version__ = "1.0.0"
 
 
@@ -118,6 +118,28 @@ def build_arg_parser() -> argparse.ArgumentParser:
             "Show specified checks in brief mode output. "
             "If no check names provided, shows all supported checks list. "
             "Use --list-checks to see available check names."
+        ),
+    )
+    debug_group.add_argument(
+        "-s",
+        "--skip-checks",
+        nargs="+",
+        metavar="CHECK_NAME",
+        help=(
+            "Skip specified checks during execution. "
+            "Can specify multiple check names. "
+            "Use --list-checks to see available check names."
+        ),
+    )
+    debug_group.add_argument(
+        "-S",
+        "--skip-categories",
+        nargs="+",
+        metavar="CATEGORY",
+        help=(
+            "Skip all checks in specified categories during execution. "
+            "Can specify multiple categories (e.g., system, hardware, interface). "
+            "Use --list-checks to see available categories."
         ),
     )
 
@@ -254,7 +276,7 @@ class TechSupportContext:
         self.total_mem: Optional[int] = None
         self.free_mem: Optional[int] = None
         self.system_time: Optional[str] = None
-        self.platform_series: str = "other"  # 78xx / 75xx / 7368 / 7289 / other
+        self.platform_series: str = "other"  # 78xx / 75xx / 7368 / 7289 / 7388 / other
 
     # Access helpers -----------------------------------------------------
 
@@ -682,6 +704,8 @@ def infer_platform_series(hw_model: Optional[str]) -> str:
         return "7368"
     if "7289" in model:
         return "7289"
+    if "7388" in model:
+        return "7388"
     return "other"
 
 
@@ -1169,7 +1193,7 @@ class MemoryUsageCheck(BaseCheck):
 class ModuleUptimeCheck(BaseCheck):
     name = "module_uptime"
     category = "hardware"
-    supported_platforms = ("78xx", "75xx", "7368", "7289")
+    supported_platforms = ("78xx", "75xx", "7368", "7289", "7388")
 
     def run(self, ctx: TechSupportContext) -> List[CheckResult]:
         blocks = ctx.get_blocks("show module")
@@ -2032,7 +2056,7 @@ class InterfaceErrorsCheck(BaseCheck):
 class HardwareCounterDropCheck(BaseCheck):
     name = "hardware_counter_drop"
     category = "hardware"
-    supported_platforms = ("78xx", "75xx", "7289")
+    supported_platforms = ("78xx", "75xx", "7289", "7388")
 
     def run(self, ctx: TechSupportContext) -> List[CheckResult]:
         blocks = ctx.get_blocks("show hardware counter drop")
@@ -2425,7 +2449,7 @@ class HardwareFpgaErrorCheck(BaseCheck):
 class ScdSatelliteRetryErrCheck(BaseCheck):
     name = "scd_satellite_retry_error"
     category = "hardware"
-    supported_platforms = ("7368", "7289")
+    supported_platforms = ("7368", "7289", "7388")
 
     def run(self, ctx: TechSupportContext) -> List[CheckResult]:
         blocks = ctx.get_blocks("show platform scd satellite debug")
@@ -2485,6 +2509,10 @@ RUNNING_CONFIG_PATTERNS_BY_PLATFORM = {
     "7289": [
         # Add patterns for 7289 here as needed
         # Example: "pattern for 7289",
+    ],
+    "7388": [
+        # Add patterns for 7388 here as needed
+        # Example: "pattern for 7388",
     ],
     # Add more platforms as needed
     # "other": [
@@ -2609,8 +2637,10 @@ class InventoryCheck(BaseCheck):
         ]
 
 
-def run_all_checks(ctx: TechSupportContext) -> List[CheckResult]:
+def run_all_checks(ctx: TechSupportContext, skip_checks: Optional[List[str]] = None, skip_categories: Optional[List[str]] = None) -> List[CheckResult]:
     results: List[CheckResult] = []
+    skip_set = set(skip_checks) if skip_checks else set()
+    skip_categories_set = set(skip_categories) if skip_categories else set()
     # Core info parsers (populate context)
     results.extend(parse_show_version(ctx))
     results.extend(parse_show_clock(ctx))
@@ -2621,6 +2651,14 @@ def run_all_checks(ctx: TechSupportContext) -> List[CheckResult]:
     LOG.debug("Detected platform series: %s (from model: %s)", ctx.platform_series, ctx.hw_model)
     # Run registered checks based on platform
     for check in REGISTERED_CHECKS:
+        # Skip if category is excluded
+        if check.category in skip_categories_set:
+            LOG.debug("Skipping check %s (category %s is excluded)", check.name, check.category)
+            continue
+        # Skip if explicitly requested
+        if check.name in skip_set:
+            LOG.debug("Skipping check %s (explicitly excluded)", check.name)
+            continue
         if not platform_supported(check, ctx.platform_series):
             LOG.debug(
                 "Skipping check %s for platform %s", check.name, ctx.platform_series
@@ -3325,14 +3363,14 @@ def format_json_report(
 # ---------------------------------------------------------------------------
 
 
-def process_showtech_text(source_id: str, text: str, mode: str, as_json: bool, debug: bool = False, show_checks_in_brief: Optional[List[str]] = None) -> str:
+def process_showtech_text(source_id: str, text: str, mode: str, as_json: bool, debug: bool = False, show_checks_in_brief: Optional[List[str]] = None, skip_checks: Optional[List[str]] = None, skip_categories: Optional[List[str]] = None) -> str:
     # Load into memory, parse, then drop raw text reference
     parser = TechSupportParser()
     blocks = parser.parse(text)
     text = ""  # release raw text reference
 
     ctx = TechSupportContext(source_id, blocks)
-    results = run_all_checks(ctx)
+    results = run_all_checks(ctx, skip_checks, skip_categories)
     brief = make_device_brief(ctx, results)
 
     # Generate report
@@ -3389,7 +3427,7 @@ def main(argv: Optional[Sequence[str]] = None) -> None:
                 except OSError as exc:
                     LOG.error("Failed to read %s: %s", f, exc)
                     continue
-                report = process_showtech_text(str(f), text, args.mode, args.json, args.debug, args.show_checks_in_brief)
+                report = process_showtech_text(str(f), text, args.mode, args.json, args.debug, args.show_checks_in_brief, args.skip_checks, args.skip_categories)
                 outputs.append(report)
                 # Release text reference after processing
                 del text
@@ -3420,7 +3458,7 @@ def main(argv: Optional[Sequence[str]] = None) -> None:
                         )
                         continue
                     report = process_showtech_text(
-                        f"{arch}!{spec.display_name}", text, args.mode, args.json, args.debug, args.show_checks_in_brief
+                        f"{arch}!{spec.display_name}", text, args.mode, args.json, args.debug, args.show_checks_in_brief, args.skip_checks, args.skip_categories
                     )
                     outputs.append(report)
                     # Release text reference after processing
@@ -3433,7 +3471,7 @@ def main(argv: Optional[Sequence[str]] = None) -> None:
                 except OSError as exc:
                     LOG.error("Failed to read %s: %s", path, exc)
                     continue
-                report = process_showtech_text(str(path), text, args.mode, args.json, args.debug, args.show_checks_in_brief)
+                report = process_showtech_text(str(path), text, args.mode, args.json, args.debug, args.show_checks_in_brief, args.skip_checks, args.skip_categories)
                 outputs.append(report)
                 # Release text reference after processing
                 del text

@@ -21,7 +21,7 @@ This tool analyzes Arista EOS show-tech / show-tech-support-all outputs and rela
 - **Platform Support** (phased implementation):
   - Phase 1: 78xx series
   - Phase 2: 75xx series
-  - Phase 3: 7368 and 7289 series
+  - Phase 3: 7368, 7289, and 7388 series
   - Phase 4: Other series
 
 - **Output Modes**:
@@ -90,6 +90,14 @@ python3 health_check_eos.py file1 file2 directory1 archive.zip
   - Show specified checks in brief mode output
   - If no check names provided, shows all supported checks list
   - Use `--list-checks` to see available check names
+- `-s CHECK_NAME [CHECK_NAME ...], --skip-checks CHECK_NAME [CHECK_NAME ...]`:
+  - Skip specified checks during execution
+  - Can specify multiple check names to skip
+  - Use `--list-checks` to see available check names
+- `-S, --skip-categories CATEGORY [CATEGORY ...]`:
+  - Skip all checks in specified categories during execution
+  - Can specify multiple categories (e.g., system, hardware, interface, process, storage, software, environment, config)
+  - Use `--list-checks` to see available categories
 
 #### Help
 
@@ -115,6 +123,21 @@ python3 health_check_eos.py --json /path/to/show-tech -o report.json
 
 # Show all checks list in brief mode
 python3 health_check_eos.py -b -c /path/to/show-tech
+
+# Skip specific checks
+python3 health_check_eos.py -s memory_usage_top cpu_usage_top /path/to/show-tech
+
+# Skip multiple checks
+python3 health_check_eos.py -s memory_usage_top cpu_usage_top interfaces_errors /path/to/show-tech
+
+# Skip entire category
+python3 health_check_eos.py -S hardware /path/to/show-tech
+
+# Skip multiple categories
+python3 health_check_eos.py -S hardware interface /path/to/show-tech
+
+# Combine skip checks and skip categories
+python3 health_check_eos.py -s memory_usage_top -S hardware /path/to/show-tech
 ```
 
 ## Health Checks
@@ -141,7 +164,7 @@ The tool performs various health checks organized by category:
 - `show hardware counter drop`: Hardware drop counters
 - `show hardware capacity`: Hardware capacity usage
 - `show hardware fpga error`: FPGA errors
-- `show platform scd satellite debug`: SCD satellite retry errors (7368, 7289)
+- `show platform scd satellite debug`: SCD satellite retry errors (7368, 7289, 7388)
 
 ### Storage Checks
 - `bash ls -ltr /var/core`: Core dump file detection
@@ -219,7 +242,7 @@ JSON mode outputs structured data:
 - FAP fabric SerDes link checks (patterns: `U--- Fe`, `I---I Fe`, etc.)
 - Redundancy status checks
 
-### 7368 and 7289 Series
+### 7368, 7289, and 7388 Series
 - SCD satellite retry error checks
 
 ## File Discovery
