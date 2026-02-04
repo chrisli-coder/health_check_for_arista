@@ -3180,26 +3180,28 @@ def format_human_report(
             lines.append("Selected Checks Details:")
             lines.append("=" * 80)
             for check_name in show_checks_in_brief:
-                # Find the check result
-                check_result = None
+                # Find all matching check results (exact match or prefix match)
+                # This handles cases where a check returns multiple results with suffixes
+                # (e.g., redundancy_status -> redundancy_status_active_unit, redundancy_status_protocol)
+                matching_results = []
                 for r in results:
-                    if r.name == check_name:
-                        check_result = r
-                        break
+                    if r.name == check_name or r.name.startswith(check_name + "_"):
+                        matching_results.append(r)
                 
-                if check_result:
-                    lines.append("")
-                    lines.append(f"Check: {check_result.category}/{check_result.name}")
-                    lines.append(f"Status: {check_result.severity.value}")
-                    lines.append(f"Summary: {check_result.summary}")
-                    if check_result.details:
-                        lines.append("Details:")
-                        for detail in check_result.details[:5]:  # Limit to first 5 details
-                            if not detail.startswith("[DEBUG"):
-                                lines.append(f"  {detail}")
-                        if len(check_result.details) > 5:
-                            lines.append(f"  ... and {len(check_result.details) - 5} more item(s)")
-                    lines.append("-" * 80)
+                if matching_results:
+                    for check_result in matching_results:
+                        lines.append("")
+                        lines.append(f"Check: {check_result.category}/{check_result.name}")
+                        lines.append(f"Status: {check_result.severity.value}")
+                        lines.append(f"Summary: {check_result.summary}")
+                        if check_result.details:
+                            lines.append("Details:")
+                            for detail in check_result.details[:5]:  # Limit to first 5 details
+                                if not detail.startswith("[DEBUG"):
+                                    lines.append(f"  {detail}")
+                            if len(check_result.details) > 5:
+                                lines.append(f"  ... and {len(check_result.details) - 5} more item(s)")
+                        lines.append("-" * 80)
                 else:
                     lines.append("")
                     lines.append(f"Check: {check_name} (not found or not executed)")
@@ -3213,8 +3215,14 @@ def format_human_report(
     # If brief mode with debug, filter results to only selected checks
     # Then continue with normal debug output logic below
     if mode == "brief" and debug and show_checks_in_brief is not None and len(show_checks_in_brief) > 0:
-        # Filter results to only selected checks
-        selected_results = [r for r in results if r.name in show_checks_in_brief]
+        # Filter results to only selected checks (exact match or prefix match)
+        # This handles cases where a check returns multiple results with suffixes
+        selected_results = []
+        for r in results:
+            for check_name in show_checks_in_brief:
+                if r.name == check_name or r.name.startswith(check_name + "_"):
+                    selected_results.append(r)
+                    break
         results = selected_results
         # Add separator before debug output (skip "Detailed checks:" header)
         lines.append("")
