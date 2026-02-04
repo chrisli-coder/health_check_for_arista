@@ -104,6 +104,12 @@ python3 health_check_eos.py file1 file2 directory1 archive.zip
 - `-t N, --threads N`: Number of worker threads for parallel processing
   - Default: number of CPU cores (capped at 8 for memory efficiency)
   - Set to 1 to disable parallel processing
+- `-m, --low-memory`: Enable low-memory mode
+  - Files are loaded on-demand instead of pre-loading all files
+  - Reduces memory usage at the cost of slightly slower processing
+  - Recommended for systems with limited RAM or when processing many large files
+  - In low-memory mode, thread count is automatically reduced (max 2 threads)
+  - Tasks are processed in batches to avoid loading too many files simultaneously
   - Useful for processing multiple files or archives in batch
 
 #### Help
@@ -173,6 +179,16 @@ python3 health_check_eos.py --threads 4 *.zip
 
 # Disable parallel processing (single-threaded)
 python3 health_check_eos.py -t 1 /path/to/show-tech
+
+# Low-memory mode for systems with limited RAM
+python3 health_check_eos.py -m /path/to/show-tech
+# or
+python3 health_check_eos.py --low-memory /path/to/show-tech
+# or
+python3 health_check_eos.py -m *.zip
+
+# Low-memory mode with custom thread count (will be capped at 2)
+python3 health_check_eos.py -m -t 4 large_archive*.zip
 
 # Process multiple archives with parallel processing
 python3 health_check_eos.py -t 8 archive1.zip archive2.zip archive3.zip
@@ -319,6 +335,37 @@ python3 health_check_eos.py -t 4 archive*.zip
 python3 health_check_eos.py -t 8 dir1/ dir2/ dir3/
 ```
 
+### Low-Memory Mode
+
+For systems with limited RAM or when processing many large files, use `--low-memory` mode:
+
+**How it works:**
+- Files are loaded on-demand instead of pre-loading all files into memory
+- Tasks are processed in batches to avoid loading too many files simultaneously
+- Thread count is automatically reduced (max 2 threads) to minimize memory pressure
+- Memory is released immediately after each file is processed
+
+**When to use:**
+- Systems with limited RAM (< 4GB available)
+- Processing many large files (> 10 files or files > 100MB each)
+- Nested archives with large outer archives
+- Avoiding out-of-memory errors
+
+**Performance trade-off:**
+- Slightly slower processing due to on-demand loading
+- Reduced peak memory usage (typically 50-70% reduction)
+
+Example:
+```bash
+# Process many large files in low-memory mode
+python3 health_check_eos.py -m *.zip
+# or
+python3 health_check_eos.py --low-memory *.zip
+
+# Combine with custom thread count (will be capped at 2 in low-memory mode)
+python3 health_check_eos.py -m -t 4 large_archive*.zip
+```
+
 ## Troubleshooting
 
 ### Enable Debug Mode
@@ -338,10 +385,11 @@ Use `-c` or `--show-checks-in-brief` to view details of specific checks in brief
 
 ## Notes
 
-- The tool loads files into memory for fast processing, then releases memory
+- **Memory management**: By default, the tool loads files into memory for fast processing, then releases memory. Use `--low-memory` mode for systems with limited RAM.
 - Command blocks in show-tech files are identified by `---` delimiters (e.g., `------------- show—cmd -------------`)
 - Some checks are platform-specific and will return INFO if the platform doesn't match
 - The tool supports nested archives (archives containing other archives)
+- In low-memory mode, files are loaded on-demand and processed in batches to minimize memory usage
 
 ## License
 

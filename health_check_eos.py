@@ -167,6 +167,16 @@ def build_arg_parser() -> argparse.ArgumentParser:
             "Default: number of CPU cores. Set to 1 to disable parallel processing."
         ),
     )
+    debug_group.add_argument(
+        "-m",
+        "--low-memory",
+        action="store_true",
+        help=(
+            "Enable low-memory mode: files are loaded on-demand instead of pre-loading all files. "
+            "Reduces memory usage at the cost of slightly slower processing. "
+            "Recommended for systems with limited RAM or when processing many large files."
+        ),
+    )
 
     return parser
 
@@ -3681,24 +3691,41 @@ def format_json_report(
 class ProcessingTask:
     """Represents a single file processing task."""
     source_id: str
-    text: str
-    mode: str
-    as_json: bool
-    debug: bool
-    show_checks_in_brief: Optional[List[str]]
-    skip_checks: Optional[List[str]]
-    skip_categories: Optional[List[str]]
+    text: Optional[str] = None  # None in lazy-load mode
+    mode: str = "brief"
+    as_json: bool = False
+    debug: bool = False
+    show_checks_in_brief: Optional[List[str]] = None
+    skip_checks: Optional[List[str]] = None
+    skip_categories: Optional[List[str]] = None
+    # Lazy-load fields (used when text is None)
+    lazy_path: Optional[Path] = None  # For plain files or directories
+    lazy_archive_path: Optional[Path] = None  # For archive members
+    lazy_archive_spec: Optional[ArchiveShowTechMember] = None  # For archive members
 
 
 def process_single_task(task: ProcessingTask) -> Tuple[str, str]:
     """
     Process a single file task and return (source_id, report).
     This function is designed to be called in parallel.
+    Supports both pre-loaded text and lazy-loading modes.
     """
+    text = task.text
     try:
+        # Lazy-load text if needed
+        if text is None:
+            if task.lazy_path is not None:
+                # Load from plain file
+                text = task.lazy_path.read_text(encoding="utf-8", errors="replace")
+            elif task.lazy_archive_path is not None and task.lazy_archive_spec is not None:
+                # Load from archive member
+                text = read_text_from_archive_member(task.lazy_archive_path, task.lazy_archive_spec)
+            else:
+                raise ValueError(f"Cannot lazy-load text for task {task.source_id}: missing lazy-load fields")
+        
         report = process_showtech_text(
             task.source_id,
-            task.text,
+            text,
             task.mode,
             task.as_json,
             task.debug,
@@ -3711,6 +3738,11 @@ def process_single_task(task: ProcessingTask) -> Tuple[str, str]:
         LOG.error("Error processing %s: %s", task.source_id, exc, exc_info=task.debug)
         error_msg = f"Error processing {task.source_id}: {exc}"
         return (task.source_id, error_msg)
+    finally:
+        # Release text reference immediately after processing (if lazy-loaded)
+        if text is not None and task.text is None:
+            del text
+            gc.collect()
 
 
 def collect_processing_tasks(
@@ -3721,10 +3753,15 @@ def collect_processing_tasks(
     show_checks_in_brief: Optional[List[str]],
     skip_checks: Optional[List[str]],
     skip_categories: Optional[List[str]],
+    low_memory: bool = False,
 ) -> List[ProcessingTask]:
     """
     Collect all file processing tasks from the given paths.
     Returns a list of ProcessingTask objects ready for parallel execution.
+    
+    Args:
+        low_memory: If True, use lazy-loading mode (files loaded on-demand).
+                    If False, pre-load all file contents into memory.
     """
     tasks: List[ProcessingTask] = []
     
@@ -3740,20 +3777,35 @@ def collect_processing_tasks(
                 continue
             for f in files:
                 LOG.info("Found show-tech file: %s", f)
-                try:
-                    text = f.read_text(encoding="utf-8", errors="replace")
+                if low_memory:
+                    # Lazy-load mode: store path, load on-demand
                     tasks.append(ProcessingTask(
                         source_id=str(f),
-                        text=text,
+                        text=None,  # Will be loaded on-demand
                         mode=mode,
                         as_json=as_json,
                         debug=debug,
                         show_checks_in_brief=show_checks_in_brief,
                         skip_checks=skip_checks,
                         skip_categories=skip_categories,
+                        lazy_path=f,
                     ))
-                except OSError as exc:
-                    LOG.error("Failed to read %s: %s", f, exc)
+                else:
+                    # Pre-load mode: load now
+                    try:
+                        text = f.read_text(encoding="utf-8", errors="replace")
+                        tasks.append(ProcessingTask(
+                            source_id=str(f),
+                            text=text,
+                            mode=mode,
+                            as_json=as_json,
+                            debug=debug,
+                            show_checks_in_brief=show_checks_in_brief,
+                            skip_checks=skip_checks,
+                            skip_categories=skip_categories,
+                        ))
+                    except OSError as exc:
+                        LOG.error("Failed to read %s: %s", f, exc)
         elif path.is_file():
             # Decide if archive or plain show-tech file
             if zipfile.is_zipfile(path) or tarfile.is_tarfile(path):
@@ -3765,10 +3817,63 @@ def collect_processing_tasks(
                     continue
                 for spec in members:
                     LOG.info("Found show-tech member: %s!%s", arch, spec.display_name)
-                    try:
-                        text = read_text_from_archive_member(arch, spec)
+                    if low_memory:
+                        # Lazy-load mode: store archive info, load on-demand
                         tasks.append(ProcessingTask(
                             source_id=f"{arch}!{spec.display_name}",
+                            text=None,  # Will be loaded on-demand
+                            mode=mode,
+                            as_json=as_json,
+                            debug=debug,
+                            show_checks_in_brief=show_checks_in_brief,
+                            skip_checks=skip_checks,
+                            skip_categories=skip_categories,
+                            lazy_archive_path=arch,
+                            lazy_archive_spec=spec,
+                        ))
+                    else:
+                        # Pre-load mode: load now
+                        try:
+                            text = read_text_from_archive_member(arch, spec)
+                            tasks.append(ProcessingTask(
+                                source_id=f"{arch}!{spec.display_name}",
+                                text=text,
+                                mode=mode,
+                                as_json=as_json,
+                                debug=debug,
+                                show_checks_in_brief=show_checks_in_brief,
+                                skip_checks=skip_checks,
+                                skip_categories=skip_categories,
+                            ))
+                        except OSError as exc:
+                            LOG.error(
+                                "Failed to read member %s from archive %s: %s",
+                                spec.display_name,
+                                arch,
+                                exc,
+                            )
+            else:
+                # Plain show-tech file
+                LOG.info("Found show-tech file: %s", path)
+                if low_memory:
+                    # Lazy-load mode: store path, load on-demand
+                    tasks.append(ProcessingTask(
+                        source_id=str(path),
+                        text=None,  # Will be loaded on-demand
+                        mode=mode,
+                        as_json=as_json,
+                        debug=debug,
+                        show_checks_in_brief=show_checks_in_brief,
+                        skip_checks=skip_checks,
+                        skip_categories=skip_categories,
+                        lazy_path=path,
+                    ))
+                else:
+                    # Pre-load mode: load now
+                    try:
+                        text = path.read_text(encoding="utf-8", errors="replace")
+                        tasks.append(ProcessingTask(
+                            source_id=str(path),
                             text=text,
                             mode=mode,
                             as_json=as_json,
@@ -3778,29 +3883,7 @@ def collect_processing_tasks(
                             skip_categories=skip_categories,
                         ))
                     except OSError as exc:
-                        LOG.error(
-                            "Failed to read member %s from archive %s: %s",
-                            spec.display_name,
-                            arch,
-                            exc,
-                        )
-            else:
-                # Plain show-tech file
-                LOG.info("Found show-tech file: %s", path)
-                try:
-                    text = path.read_text(encoding="utf-8", errors="replace")
-                    tasks.append(ProcessingTask(
-                        source_id=str(path),
-                        text=text,
-                        mode=mode,
-                        as_json=as_json,
-                        debug=debug,
-                        show_checks_in_brief=show_checks_in_brief,
-                        skip_checks=skip_checks,
-                        skip_categories=skip_categories,
-                    ))
-                except OSError as exc:
-                    LOG.error("Failed to read %s: %s", path, exc)
+                        LOG.error("Failed to read %s: %s", path, exc)
         else:
             LOG.error("Path does not exist or is not accessible: %s", path)
     
@@ -3858,6 +3941,7 @@ def main(argv: Optional[Sequence[str]] = None) -> None:
 
     # Collect all processing tasks
     LOG.info("Collecting processing tasks from %d path(s)...", len(args.paths))
+    low_memory = getattr(args, 'low_memory', False)
     tasks = collect_processing_tasks(
         args.paths,
         args.mode,
@@ -3866,6 +3950,7 @@ def main(argv: Optional[Sequence[str]] = None) -> None:
         args.show_checks_in_brief,
         args.skip_checks,
         args.skip_categories,
+        low_memory=low_memory,
     )
     
     if not tasks:
@@ -3873,12 +3958,21 @@ def main(argv: Optional[Sequence[str]] = None) -> None:
         return
     
     LOG.info("Found %d file(s) to process", len(tasks))
+    if low_memory:
+        LOG.info("Low-memory mode enabled: files will be loaded on-demand")
     
     # Determine number of threads
     num_threads = args.threads
     if num_threads is None:
-        # Default to number of CPU cores, but cap at 8 for memory efficiency
-        num_threads = min(_os.cpu_count() or 1, 8)
+        if low_memory:
+            # In low-memory mode, use fewer threads to reduce memory pressure
+            # Default to 2 threads or CPU count (whichever is smaller), capped at 4
+            num_threads = min(_os.cpu_count() or 1, 4)
+            if num_threads > 2:
+                num_threads = 2
+        else:
+            # Default to number of CPU cores, but cap at 8 for memory efficiency
+            num_threads = min(_os.cpu_count() or 1, 8)
     elif num_threads < 1:
         LOG.warning("Invalid thread count %d, using 1", num_threads)
         num_threads = 1
@@ -3902,45 +3996,95 @@ def main(argv: Optional[Sequence[str]] = None) -> None:
         gc.collect()
     else:
         # Parallel processing with thread pool
-        LOG.info("Processing %d file(s) using %d thread(s)...", len(tasks), num_threads)
-        with concurrent.futures.ThreadPoolExecutor(max_workers=num_threads) as executor:
-            # Submit all tasks and maintain order
-            future_to_index = {}
-            for idx, task in enumerate(tasks):
-                future = executor.submit(process_single_task, task)
-                future_to_index[future] = idx
+        if low_memory and len(tasks) > num_threads * 2:
+            # In low-memory mode with many tasks, process in batches
+            # to avoid loading too many files simultaneously
+            batch_size = num_threads * 2  # Process 2x thread count at a time
+            LOG.info("Processing %d file(s) using %d thread(s) in batches of %d...", 
+                     len(tasks), num_threads, batch_size)
             
-            # Collect results in submission order
-            results: List[Optional[str]] = [None] * len(tasks)
-            completed_futures = []
-            for future in concurrent.futures.as_completed(future_to_index.keys()):
-                idx = future_to_index[future]
-                task = tasks[idx]
-                try:
-                    source_id, report = future.result()
-                    results[idx] = report
-                    LOG.info("Completed: %s", source_id)
-                except Exception as exc:
-                    LOG.error("Task %s raised an exception: %s", task.source_id, exc, exc_info=args.debug)
-                    results[idx] = f"Error processing {task.source_id}: {exc}"
-                finally:
-                    # Release task text reference immediately after processing
-                    del task.text
-                    completed_futures.append(future)
+            for batch_start in range(0, len(tasks), batch_size):
+                batch_end = min(batch_start + batch_size, len(tasks))
+                batch_tasks = tasks[batch_start:batch_end]
+                LOG.info("Processing batch %d-%d of %d...", batch_start + 1, batch_end, len(tasks))
+                
+                with concurrent.futures.ThreadPoolExecutor(max_workers=num_threads) as executor:
+                    # Submit batch tasks
+                    future_to_index = {}
+                    for idx, task in enumerate(batch_tasks):
+                        future = executor.submit(process_single_task, task)
+                        future_to_index[future] = idx
+                    
+                    # Collect results in submission order
+                    batch_results: List[Optional[str]] = [None] * len(batch_tasks)
+                    for future in concurrent.futures.as_completed(future_to_index.keys()):
+                        idx = future_to_index[future]
+                        task = batch_tasks[idx]
+                        try:
+                            source_id, report = future.result()
+                            batch_results[idx] = report
+                            LOG.info("Completed: %s", source_id)
+                        except Exception as exc:
+                            LOG.error("Task %s raised an exception: %s", task.source_id, exc, exc_info=args.debug)
+                            batch_results[idx] = f"Error processing {task.source_id}: {exc}"
+                        finally:
+                            # Release task text reference immediately after processing
+                            if task.text is not None:
+                                del task.text
+                    
+                    # Add batch results to outputs
+                    outputs.extend(r for r in batch_results if r is not None)
+                    
+                    # Clean up batch
+                    del batch_results
+                    del future_to_index
+                    gc.collect()
             
-            # Add results in order
-            outputs.extend(r for r in results if r is not None)
+            # Clean up tasks list after all batches complete
+            del tasks
+            gc.collect()
+        else:
+            # Standard parallel processing (all tasks at once)
+            LOG.info("Processing %d file(s) using %d thread(s)...", len(tasks), num_threads)
+            with concurrent.futures.ThreadPoolExecutor(max_workers=num_threads) as executor:
+                # Submit all tasks and maintain order
+                future_to_index = {}
+                for idx, task in enumerate(tasks):
+                    future = executor.submit(process_single_task, task)
+                    future_to_index[future] = idx
+                
+                # Collect results in submission order
+                results: List[Optional[str]] = [None] * len(tasks)
+                completed_futures = []
+                for future in concurrent.futures.as_completed(future_to_index.keys()):
+                    idx = future_to_index[future]
+                    task = tasks[idx]
+                    try:
+                        source_id, report = future.result()
+                        results[idx] = report
+                        LOG.info("Completed: %s", source_id)
+                    except Exception as exc:
+                        LOG.error("Task %s raised an exception: %s", task.source_id, exc, exc_info=args.debug)
+                        results[idx] = f"Error processing {task.source_id}: {exc}"
+                    finally:
+                        # Release task text reference immediately after processing
+                        if task.text is not None:
+                            del task.text
+                        completed_futures.append(future)
+                
+                # Add results in order
+                outputs.extend(r for r in results if r is not None)
+                
+                # Clean up: release completed futures, results, and future_to_index
+                del completed_futures
+                del results
+                del future_to_index
+                # Note: tasks list will be cleaned up after the with block
             
-            # Clean up: release completed futures, results, and future_to_index
-            del completed_futures
-            del results
-            del future_to_index
-            # Note: tasks list will be cleaned up after the with block
-        
-        # Clean up tasks list after thread pool closes
-        del tasks
-        # Force garbage collection after all tasks complete
-        gc.collect()
+            # Clean up tasks list after thread pool closes
+            del tasks
+            # Force garbage collection after all tasks complete
+            gc.collect()
 
     final_output = "\n\n".join(outputs)
     
