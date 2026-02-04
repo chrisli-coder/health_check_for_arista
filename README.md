@@ -94,10 +94,17 @@ python3 health_check_eos.py file1 file2 directory1 archive.zip
   - Skip specified checks during execution
   - Can specify multiple check names to skip
   - Use `--list-checks` to see available check names
-- `-S, --skip-categories CATEGORY [CATEGORY ...]`:
+- `-S CATEGORY [CATEGORY ...], --skip-categories CATEGORY [CATEGORY ...]`:
   - Skip all checks in specified categories during execution
   - Can specify multiple categories (e.g., system, hardware, interface, process, storage, software, environment, config)
   - Use `--list-checks` to see available categories
+
+#### Performance
+
+- `-t N, --threads N`: Number of worker threads for parallel processing
+  - Default: number of CPU cores (capped at 8 for memory efficiency)
+  - Set to 1 to disable parallel processing
+  - Useful for processing multiple files or archives in batch
 
 #### Help
 
@@ -158,6 +165,17 @@ python3 health_check_eos.py file1 file2 directory1 archive.zip
 
 # Analyze archive file
 python3 health_check_eos.py /path/to/support-bundle.zip
+
+# Process multiple files in parallel (using 4 threads)
+python3 health_check_eos.py -t 4 *.zip
+# or
+python3 health_check_eos.py --threads 4 *.zip
+
+# Disable parallel processing (single-threaded)
+python3 health_check_eos.py -t 1 /path/to/show-tech
+
+# Process multiple archives with parallel processing
+python3 health_check_eos.py -t 8 archive1.zip archive2.zip archive3.zip
 ```
 
 ## Health Checks
@@ -271,6 +289,35 @@ The tool automatically detects input type (file, directory, or archive) and sear
 - Exact filenames: `show-tech` or `show-tech-support-all`
 - Files in support-bundle directories: `support-bundle/tmp/support-bundle-cmds/show-tech`
 - Files in nested archives
+
+## Performance Optimization
+
+### Parallel Processing
+
+The tool supports multi-threaded processing for improved performance when handling multiple files:
+
+- **Default behavior**: Automatically uses the number of CPU cores (capped at 8) for parallel processing
+- **Custom thread count**: Use `-t N` or `--threads N` to specify the number of worker threads
+- **Single-threaded mode**: Use `-t 1` to disable parallel processing (useful for debugging or memory-constrained environments)
+
+**When to use parallel processing:**
+- Processing multiple show-tech files
+- Processing multiple archive files
+- Batch processing scenarios
+
+**Performance tips:**
+- For I/O-bound workloads (reading from disk/archives), parallel processing provides significant speedup
+- For CPU-bound workloads (parsing large files), moderate thread counts (4-8) work best
+- Memory usage increases with thread count, so adjust `-t` based on available RAM
+
+Example:
+```bash
+# Process 10 archive files using 4 threads
+python3 health_check_eos.py -t 4 archive*.zip
+
+# Process multiple directories in parallel
+python3 health_check_eos.py -t 8 dir1/ dir2/ dir3/
+```
 
 ## Troubleshooting
 

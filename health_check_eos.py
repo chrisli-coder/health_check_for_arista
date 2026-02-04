@@ -14,6 +14,7 @@ health report in brief or verbose form.
 from __future__ import annotations
 
 import argparse
+import concurrent.futures
 import datetime as _dt
 import gc
 import json
@@ -62,6 +63,8 @@ def build_arg_parser() -> argparse.ArgumentParser:
             "  %(prog)s -s memory_usage_top /path/to/show-tech  # Skip specific check\n"
             "  %(prog)s -S hardware /path/to/show-tech       # Skip entire category\n"
             "  %(prog)s -s cpu_usage_top -S hardware /path/to/show-tech  # Combine options\n"
+            "  %(prog)s -t 4 *.zip                           # Process archives with 4 threads\n"
+            "  %(prog)s -t 1 /path/to/show-tech              # Disable parallel processing\n"
             "\n"
             "Author  : %(author)s\n"
             "Company : %(company)s\n"
@@ -151,6 +154,17 @@ def build_arg_parser() -> argparse.ArgumentParser:
             "Skip all checks in specified categories during execution. "
             "Can specify multiple categories (e.g., system, hardware, interface). "
             "Use --list-checks to see available categories."
+        ),
+    )
+    debug_group.add_argument(
+        "-t",
+        "--threads",
+        type=int,
+        metavar="N",
+        default=None,
+        help=(
+            "Number of worker threads for parallel processing. "
+            "Default: number of CPU cores. Set to 1 to disable parallel processing."
         ),
     )
 
@@ -3655,10 +3669,142 @@ def format_json_report(
 # ---------------------------------------------------------------------------
 
 
+@dataclass
+class ProcessingTask:
+    """Represents a single file processing task."""
+    source_id: str
+    text: str
+    mode: str
+    as_json: bool
+    debug: bool
+    show_checks_in_brief: Optional[List[str]]
+    skip_checks: Optional[List[str]]
+    skip_categories: Optional[List[str]]
+
+
+def process_single_task(task: ProcessingTask) -> Tuple[str, str]:
+    """
+    Process a single file task and return (source_id, report).
+    This function is designed to be called in parallel.
+    """
+    try:
+        report = process_showtech_text(
+            task.source_id,
+            task.text,
+            task.mode,
+            task.as_json,
+            task.debug,
+            task.show_checks_in_brief,
+            task.skip_checks,
+            task.skip_categories,
+        )
+        return (task.source_id, report)
+    except Exception as exc:
+        LOG.error("Error processing %s: %s", task.source_id, exc, exc_info=task.debug)
+        error_msg = f"Error processing {task.source_id}: {exc}"
+        return (task.source_id, error_msg)
+
+
+def collect_processing_tasks(
+    paths: List[str],
+    mode: str,
+    as_json: bool,
+    debug: bool,
+    show_checks_in_brief: Optional[List[str]],
+    skip_checks: Optional[List[str]],
+    skip_categories: Optional[List[str]],
+) -> List[ProcessingTask]:
+    """
+    Collect all file processing tasks from the given paths.
+    Returns a list of ProcessingTask objects ready for parallel execution.
+    """
+    tasks: List[ProcessingTask] = []
+    
+    for path_str in paths:
+        path = Path(path_str)
+        if path.is_dir():
+            # Unpacked support-bundle directory
+            root = path
+            LOG.info("Discovering show-tech files in directory: %s", root)
+            files = discover_showtech_files_from_directory(root)
+            if not files:
+                LOG.warning("No show-tech files found under directory: %s", root)
+                continue
+            for f in files:
+                LOG.info("Found show-tech file: %s", f)
+                try:
+                    text = f.read_text(encoding="utf-8", errors="replace")
+                    tasks.append(ProcessingTask(
+                        source_id=str(f),
+                        text=text,
+                        mode=mode,
+                        as_json=as_json,
+                        debug=debug,
+                        show_checks_in_brief=show_checks_in_brief,
+                        skip_checks=skip_checks,
+                        skip_categories=skip_categories,
+                    ))
+                except OSError as exc:
+                    LOG.error("Failed to read %s: %s", f, exc)
+        elif path.is_file():
+            # Decide if archive or plain show-tech file
+            if zipfile.is_zipfile(path) or tarfile.is_tarfile(path):
+                arch = path
+                LOG.info("Discovering show-tech files in archive: %s", arch)
+                members = discover_showtech_members_from_archive(arch)
+                if not members:
+                    LOG.warning("No show-tech files found in archive: %s", arch)
+                    continue
+                for spec in members:
+                    LOG.info("Found show-tech member: %s!%s", arch, spec.display_name)
+                    try:
+                        text = read_text_from_archive_member(arch, spec)
+                        tasks.append(ProcessingTask(
+                            source_id=f"{arch}!{spec.display_name}",
+                            text=text,
+                            mode=mode,
+                            as_json=as_json,
+                            debug=debug,
+                            show_checks_in_brief=show_checks_in_brief,
+                            skip_checks=skip_checks,
+                            skip_categories=skip_categories,
+                        ))
+                    except OSError as exc:
+                        LOG.error(
+                            "Failed to read member %s from archive %s: %s",
+                            spec.display_name,
+                            arch,
+                            exc,
+                        )
+            else:
+                # Plain show-tech file
+                LOG.info("Found show-tech file: %s", path)
+                try:
+                    text = path.read_text(encoding="utf-8", errors="replace")
+                    tasks.append(ProcessingTask(
+                        source_id=str(path),
+                        text=text,
+                        mode=mode,
+                        as_json=as_json,
+                        debug=debug,
+                        show_checks_in_brief=show_checks_in_brief,
+                        skip_checks=skip_checks,
+                        skip_categories=skip_categories,
+                    ))
+                except OSError as exc:
+                    LOG.error("Failed to read %s: %s", path, exc)
+        else:
+            LOG.error("Path does not exist or is not accessible: %s", path)
+    
+    return tasks
+
+
 def process_showtech_text(source_id: str, text: str, mode: str, as_json: bool, debug: bool = False, show_checks_in_brief: Optional[List[str]] = None, skip_checks: Optional[List[str]] = None, skip_categories: Optional[List[str]] = None) -> str:
     # Load into memory, parse, then drop raw text reference
     parser = TechSupportParser()
     blocks = parser.parse(text)
+    # Release parser and text references immediately after parsing
+    del parser
     text = ""  # release raw text reference
 
     ctx = TechSupportContext(source_id, blocks)
@@ -3686,6 +3832,8 @@ def process_showtech_text(source_id: str, text: str, mode: str, as_json: bool, d
 
 
 def main(argv: Optional[Sequence[str]] = None) -> None:
+    import os as _os
+    
     args = parse_args(argv)
     configure_logging(args.debug)
 
@@ -3700,88 +3848,113 @@ def main(argv: Optional[Sequence[str]] = None) -> None:
         print("error: the following arguments are required: PATH (unless using --list-checks)", file=sys.stderr)
         sys.exit(2)
 
+    # Collect all processing tasks
+    LOG.info("Collecting processing tasks from %d path(s)...", len(args.paths))
+    tasks = collect_processing_tasks(
+        args.paths,
+        args.mode,
+        args.json,
+        args.debug,
+        args.show_checks_in_brief,
+        args.skip_checks,
+        args.skip_categories,
+    )
+    
+    if not tasks:
+        LOG.warning("No show-tech files found to process.")
+        return
+    
+    LOG.info("Found %d file(s) to process", len(tasks))
+    
+    # Determine number of threads
+    num_threads = args.threads
+    if num_threads is None:
+        # Default to number of CPU cores, but cap at 8 for memory efficiency
+        num_threads = min(_os.cpu_count() or 1, 8)
+    elif num_threads < 1:
+        LOG.warning("Invalid thread count %d, using 1", num_threads)
+        num_threads = 1
+    
+    # Process tasks in parallel or sequentially
     outputs: List[str] = []
-
-    for path_str in args.paths:
-        path = Path(path_str)
-        if path.is_dir():
-            # Unpacked support-bundle directory
-            root = path
-            LOG.info("Processing directory: %s", root)
-            files = discover_showtech_files_from_directory(root)
-            if not files:
-                LOG.warning("No show-tech files found under directory: %s", root)
-                continue
-            for f in files:
-                LOG.info("Processing show-tech file from directory: %s", f)
+    
+    if num_threads == 1 or len(tasks) == 1:
+        # Sequential processing (single thread or single task)
+        LOG.info("Processing %d file(s) sequentially...", len(tasks))
+        for task in tasks:
+            LOG.info("Processing: %s", task.source_id)
+            source_id, report = process_single_task(task)
+            outputs.append(report)
+            # Release task text reference immediately after processing
+            del task.text
+            gc.collect()
+        
+        # Clean up tasks list after sequential processing
+        del tasks
+        gc.collect()
+    else:
+        # Parallel processing with thread pool
+        LOG.info("Processing %d file(s) using %d thread(s)...", len(tasks), num_threads)
+        with concurrent.futures.ThreadPoolExecutor(max_workers=num_threads) as executor:
+            # Submit all tasks and maintain order
+            future_to_index = {}
+            for idx, task in enumerate(tasks):
+                future = executor.submit(process_single_task, task)
+                future_to_index[future] = idx
+            
+            # Collect results in submission order
+            results: List[Optional[str]] = [None] * len(tasks)
+            completed_futures = []
+            for future in concurrent.futures.as_completed(future_to_index.keys()):
+                idx = future_to_index[future]
+                task = tasks[idx]
                 try:
-                    text = f.read_text(encoding="utf-8", errors="replace")
-                except OSError as exc:
-                    LOG.error("Failed to read %s: %s", f, exc)
-                    continue
-                report = process_showtech_text(str(f), text, args.mode, args.json, args.debug, args.show_checks_in_brief, args.skip_checks, args.skip_categories)
-                outputs.append(report)
-                # Release text reference after processing
-                del text
-                gc.collect()
-        elif path.is_file():
-            # Decide if archive or plain show-tech file
-            if zipfile.is_zipfile(path) or tarfile.is_tarfile(path):
-                arch = path
-                LOG.info("Processing archive: %s", arch)
-                members = discover_showtech_members_from_archive(arch)
-                if not members:
-                    LOG.warning("No show-tech files found in archive: %s", arch)
-                    continue
-                for spec in members:
-                    LOG.info(
-                        "Processing show-tech member from archive %s: %s",
-                        arch,
-                        spec.display_name,
-                    )
-                    try:
-                        text = read_text_from_archive_member(arch, spec)
-                    except OSError as exc:
-                        LOG.error(
-                            "Failed to read member %s from archive %s: %s",
-                            spec.display_name,
-                            arch,
-                            exc,
-                        )
-                        continue
-                    report = process_showtech_text(
-                        f"{arch}!{spec.display_name}", text, args.mode, args.json, args.debug, args.show_checks_in_brief, args.skip_checks, args.skip_categories
-                    )
-                    outputs.append(report)
-                    # Release text reference after processing
-                    del text
-                    gc.collect()
-            else:
-                LOG.info("Processing show-tech file: %s", path)
-                try:
-                    text = path.read_text(encoding="utf-8", errors="replace")
-                except OSError as exc:
-                    LOG.error("Failed to read %s: %s", path, exc)
-                    continue
-                report = process_showtech_text(str(path), text, args.mode, args.json, args.debug, args.show_checks_in_brief, args.skip_checks, args.skip_categories)
-                outputs.append(report)
-                # Release text reference after processing
-                del text
-                gc.collect()
-        else:
-            LOG.error("Path does not exist or is not accessible: %s", path)
+                    source_id, report = future.result()
+                    results[idx] = report
+                    LOG.info("Completed: %s", source_id)
+                except Exception as exc:
+                    LOG.error("Task %s raised an exception: %s", task.source_id, exc, exc_info=args.debug)
+                    results[idx] = f"Error processing {task.source_id}: {exc}"
+                finally:
+                    # Release task text reference immediately after processing
+                    del task.text
+                    completed_futures.append(future)
+            
+            # Add results in order
+            outputs.extend(r for r in results if r is not None)
+            
+            # Clean up: release completed futures, results, and future_to_index
+            del completed_futures
+            del results
+            del future_to_index
+            # Note: tasks list will be cleaned up after the with block
+        
+        # Clean up tasks list after thread pool closes
+        del tasks
+        # Force garbage collection after all tasks complete
+        gc.collect()
 
     final_output = "\n\n".join(outputs)
+    
+    # Release outputs list after creating final_output
+    del outputs
+    gc.collect()
 
     if args.output:
         out_path = Path(args.output)
         try:
             out_path.write_text(final_output, encoding="utf-8")
+            LOG.info("Report written to: %s", out_path)
+            # Release final_output after writing to file
+            del final_output
+            gc.collect()
         except OSError as exc:
             LOG.error("Failed to write output to %s: %s", out_path, exc)
             print(final_output)
+            # final_output will be released when function exits
     else:
         print(final_output)
+        # final_output will be released when function exits
 
 
 if __name__ == "__main__":
