@@ -338,14 +338,24 @@ class TechSupportContext:
 
 def discover_showtech_files_from_directory(root: Path) -> List[Path]:
     """Recursively find show-tech/show-tech-support-all files under a directory."""
-    # Only match exact filenames (case-insensitive) for automatic discovery.
-    valid_names = ("show-tech", "show-tech-support-all")
+    # Match exact filenames or files containing show-tech/show-tech-support-all
+    # Examples: "show-tech", "show-tech-support-all", 
+    #           "localhost-show-tech-support-all-2026_02_08-07_29_38.log", etc.
     results: List[Path] = []
     for path in root.rglob("*"):
         if not path.is_file():
             continue
         name = path.name.lower()
-        if name in valid_names:
+        # Exact match
+        if name in ("show-tech", "show-tech-support-all"):
+            results.append(path)
+        # Contains show-tech-support-all (for files like localhost-show-tech-support-all-*.log)
+        elif "show-tech-support-all" in name:
+            results.append(path)
+        # Starts with show-tech but not extended variants
+        elif (name.startswith("show-tech") and 
+              not name.startswith("show-tech-support-extended") and
+              not name.startswith("show-tech-support-ribd")):
             results.append(path)
     return results
 
@@ -368,8 +378,14 @@ def discover_showtech_members_from_archive(archive_path: Path) -> List[ArchiveSh
 
     def is_showtech(name_: str) -> bool:
         base = os.path.basename(name_).lower()
-        # Only accept exact show-tech or show-tech-support-all when auto-discovered.
-        return base in ("show-tech", "show-tech-support-all")
+        # Accept exact match or files containing show-tech/show-tech-support-all
+        # Examples: "show-tech", "show-tech-support-all", 
+        #           "localhost-show-tech-support-all-2026_02_08-07_29_38.log",
+        #           "tmp/support-bundle-cmds/show-tech", etc.
+        return (base in ("show-tech", "show-tech-support-all") or
+                "show-tech-support-all" in base or
+                (base.startswith("show-tech") and not base.startswith("show-tech-support-extended") 
+                 and not base.startswith("show-tech-support-ribd")))
     def is_nested_archive(name_: str) -> bool:
         lower = name_.lower()
         return lower.endswith((".zip", ".tar", ".tar.gz", ".tgz"))
