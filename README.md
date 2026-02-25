@@ -90,6 +90,7 @@ python3 health_check_eos.py file1 file2 directory1 archive.zip
   - Show specified checks in brief mode output
   - If no check names provided, shows all supported checks list
   - Use `--list-checks` to see available check names
+  - **Using `-c` automatically enables debug mode (`-d`)** for easier troubleshooting
 - `-s CHECK_NAME [CHECK_NAME ...], --skip-checks CHECK_NAME [CHECK_NAME ...]`:
   - Skip specified checks during execution
   - Can specify multiple check names to skip
@@ -381,7 +382,7 @@ Use `-l` or `--list-checks` to see all supported checks with their commands and 
 
 ### View Specific Checks
 
-Use `-c` or `--show-checks-in-brief` to view details of specific checks in brief mode.
+Use `-c` or `--show-checks-in-brief` to view details of specific checks in brief mode. Debug mode (`-d`) is automatically enabled when you use `-c`, so you will also see processing logs and full raw outputs.
 
 ## Notes
 

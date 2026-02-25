@@ -202,6 +202,10 @@ def parse_args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
     else:
         args.mode = "brief"
 
+    # When -c (show-checks-in-brief) is used, automatically enable debug mode.
+    if args.show_checks_in_brief is not None:
+        args.debug = True
+
     return args
 
 
