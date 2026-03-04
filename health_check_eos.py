@@ -3720,7 +3720,6 @@ def format_json_report(
             "system_time": brief.system_time,
             "health": brief.health.value,
             "warn_count": brief.warn_count,
-            "error_count": brief.error_count,
         },
     }
     if mode == "verbose":
