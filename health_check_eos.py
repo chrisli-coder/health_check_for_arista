@@ -31,7 +31,7 @@ from typing import Dict, Iterable, List, Optional, Sequence, Tuple
 
 __author__ = "chris.li@arista.com"
 __company__ = "Arista Networks"
-__last_modified__ = "2026-02-09"
+__last_modified__ = "2026-03-04"
 __version__ = "1.1.0"
 
 
