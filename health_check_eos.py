@@ -1292,8 +1292,8 @@ class ModuleUptimeCheck(BaseCheck):
                     header_line_idx = i
                     break
         
-        # Normal status values
-        normal_statuses = {"Ok", "Active", "Standby"}
+        # Normal status values (Ok/OK and Active/Standby are both valid across EOS versions)
+        normal_statuses = {"Ok", "OK", "Active", "Standby"}
         
         # Only parse data rows after the Status/Uptime header is found
         if header_found:
@@ -1313,20 +1313,31 @@ class ModuleUptimeCheck(BaseCheck):
                 if len(line) > uptime_col_start:
                     # Extract Status column
                     status_str = line[status_col_start:uptime_col_start].strip()
-                    # Extract Uptime column
+                    # Extract Uptime column (strip trailing "N/A" if Power column bled into slice)
                     uptime_str = line[uptime_col_start:uptime_col_end].strip()
+                    if uptime_str.endswith(" N/A"):
+                        uptime_str = uptime_str[:-4].strip()
                     
                     # Check if status is abnormal (not in normal_statuses)
                     is_abnormal_status = status_str and status_str not in normal_statuses
                     
                     # Check if uptime is abnormal (N/A, 0 days, or 00:00)
+                    # Interpret "0 days" strictly as zero, not any string containing "0 days"
+                    days_is_zero = False
+                    m = re.search(r"(\d+)\s+days", uptime_str)
+                    if m:
+                        try:
+                            days_is_zero = int(m.group(1)) == 0
+                        except ValueError:
+                            days_is_zero = False
+
                     is_abnormal_uptime = (
                         uptime_str == "N/A"
-                        or "0 days" in uptime_str
+                        or days_is_zero
                         or uptime_str.startswith("00:00")
                         or (uptime_str and not re.search(r"\d+", uptime_str))  # No numbers at all
                     )
-                    
+
                     if is_abnormal_status or is_abnormal_uptime:
                         anomalous.append(line.strip())
         if not anomalous:
