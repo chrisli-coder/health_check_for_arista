@@ -104,6 +104,14 @@ def build_arg_parser() -> argparse.ArgumentParser:
         help="Brief report mode (default).",
     )
     output_group.add_argument(
+        "-w",
+        "--warn-only",
+        action="store_true",
+        help=(
+            "Warn-only report mode: brief summary plus all WARN-severity checks."
+        ),
+    )
+    output_group.add_argument(
         "-j",
         "--json",
         action="store_true",
@@ -196,9 +204,14 @@ def parse_args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
         parser.epilog = parser.epilog % meta  # type: ignore[operator]
     args = parser.parse_args(argv)
 
-    # Resolve brief/verbose: verbose overrides brief, default is brief.
+    # Resolve output mode:
+    # - verbose overrides other modes
+    # - warn-only shows brief summary plus all WARN-severity checks
+    # - default is brief
     if args.verbose:
         args.mode = "verbose"
+    elif getattr(args, "warn_only", False):
+        args.mode = "warn"
     else:
         args.mode = "brief"
 
@@ -3274,10 +3287,17 @@ def format_human_report(
         lines.append("Debug output for selected checks:")
         lines.append("-" * 80)
     else:
-        # verbose/debug: detailed checks with horizontal separators
+        # verbose/debug/warn-only: detailed checks with horizontal separators
         lines.append("")
-        lines.append("Detailed checks:")
+        if mode == "warn":
+            lines.append("WARN checks:")
+        else:
+            lines.append("Detailed checks:")
         lines.append("-" * 80)
+
+    # In warn-only mode, only keep WARN-severity results
+    if mode == "warn":
+        results = [r for r in results if r.severity == Severity.WARN]
     
     for r in results:
         # In brief mode with debug and selected checks, skip summary/details (already shown above)
@@ -3288,7 +3308,7 @@ def format_human_report(
             # In verbose mode, limit details to avoid excessive output
             # Show only summary and important lines (max 10 details)
             # Exception: inventory check should not show details in verbose mode
-            if mode == "verbose" and not debug:
+            if mode in ("verbose", "warn") and not debug:
                 if r.name == "inventory":
                     # Skip details for inventory check in verbose mode
                     pass

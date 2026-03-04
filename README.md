@@ -26,6 +26,7 @@ This tool analyzes Arista EOS show-tech / show-tech-support-all outputs and rela
 
 - **Output Modes**:
   - Brief mode: Summary with key information (hostname, version, model, system time, health status)
+  - Warn-only mode: Brief summary plus all WARN-severity check results
   - Verbose mode: Detailed output for all checked items
   - Debug mode: Full raw command outputs for troubleshooting
   - JSON mode: Machine-readable JSON format
@@ -75,6 +76,7 @@ python3 health_check_eos.py file1 file2 directory1 archive.zip
 #### Output Modes
 
 - `-b, --brief`: Brief report mode (default)
+- `-w, --warn-only`: Warn-only mode (brief summary + all WARN-severity checks)
 - `-v, --verbose`: Verbose report mode (includes all check details)
 - `-d, --debug`: Enable debug logging and show full raw outputs
 - `-j, --json`: Output report in JSON format
