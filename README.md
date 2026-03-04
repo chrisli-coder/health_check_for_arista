@@ -233,7 +233,7 @@ The tool performs various health checks organized by category:
 
 ### System Logs
 - `show agent logs crash`: Agent crash logs
-- `show logging threshold errors`: ECC/CRC error logs
+- `show logging threshold errors`: Pattern-based scan for ECC/CRC keywords and high-severity syslog entries (levels 0–2), with warning summary and matching lines.
 - `show system environment power detail`: Power input voltage
 
 ### Configuration Checks
