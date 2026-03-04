@@ -3218,7 +3218,7 @@ def format_human_report(
         [
             "BRIEF",
             "Health",
-            f"{brief.health.value} (WARN={brief.warn_count}, ERROR={brief.error_count})",
+            f"{brief.health.value} (WARN={brief.warn_count})",
             "",
         ],
     ]
