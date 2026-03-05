@@ -1334,22 +1334,24 @@ class ModuleUptimeCheck(BaseCheck):
                     # Check if status is abnormal (not in normal_statuses)
                     is_abnormal_status = status_str and status_str not in normal_statuses
                     
-                    # Check if uptime is abnormal (N/A, 0 days, or 00:00)
-                    # Interpret "0 days" strictly as zero, not any string containing "0 days"
-                    days_is_zero = False
-                    m = re.search(r"(\d+)\s+days", uptime_str)
-                    if m:
-                        try:
-                            days_is_zero = int(m.group(1)) == 0
-                        except ValueError:
-                            days_is_zero = False
-
-                    is_abnormal_uptime = (
-                        uptime_str == "N/A"
-                        or days_is_zero
-                        or uptime_str.startswith("00:00")
-                        or (uptime_str and not re.search(r"\d+", uptime_str))  # No numbers at all
-                    )
+                    # Check if uptime is abnormal: only when uptime < 1 hour (i.e. hours field is 0)
+                    # N/A or no numbers -> abnormal; otherwise parse "N days H:MM:SS" and require days==0 and H==0
+                    is_abnormal_uptime = False
+                    if uptime_str == "N/A" or (uptime_str and not re.search(r"\d+", uptime_str)):
+                        is_abnormal_uptime = True
+                    else:
+                        # Parse "X day(s) H:MM:SS" -> uptime < 1 hour when days==0 and hours==0
+                        md = re.search(r"(\d+)\s+day(s?)\s+(\d+):(\d+):(\d+)", uptime_str)
+                        if md:
+                            days_val = int(md.group(1))
+                            hours_val = int(md.group(3))
+                            if days_val == 0 and hours_val == 0:
+                                is_abnormal_uptime = True
+                        else:
+                            # Fallback: only "H:MM:SS" (e.g. "0:30:00") -> hour 0 means < 1 hour
+                            mt = re.search(r"(\d+):(\d+):(\d+)", uptime_str)
+                            if mt and int(mt.group(1)) == 0:
+                                is_abnormal_uptime = True
 
                     if is_abnormal_status or is_abnormal_uptime:
                         anomalous.append(line.strip())
