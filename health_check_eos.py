@@ -1341,10 +1341,11 @@ class ModuleUptimeCheck(BaseCheck):
                         is_abnormal_uptime = True
                     else:
                         # Parse "X day(s) H:MM:SS" -> uptime < 1 hour when days==0 and hours==0
-                        md = re.search(r"(\d+)\s+day(s?)\s+(\d+):(\d+):(\d+)", uptime_str)
+                        # EOS commonly prints: "127 days, 0:53:56" (note the comma)
+                        md = re.search(r"(\d+)\s+day(?:s)?[,]?\s+(\d+):(\d+):(\d+)", uptime_str)
                         if md:
                             days_val = int(md.group(1))
-                            hours_val = int(md.group(3))
+                            hours_val = int(md.group(2))
                             if days_val == 0 and hours_val == 0:
                                 is_abnormal_uptime = True
                         else:
