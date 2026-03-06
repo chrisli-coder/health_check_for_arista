@@ -1780,7 +1780,8 @@ class PowerInputCheck(BaseCheck):
 # Add/remove rules by appending or deleting a line in the list below; matching is case-insensitive.
 LOGGING_THRESHOLD_ERROR_PATTERNS = [
     # Memory / link error /DRAM fatal interrupt indicators
-    r"\bECC\b",
+    # ECC: exclude "ecc" in IPv6 addresses (e.g. 93f:ecc) via negative lookbehind
+    r"(?<!:)\bECC\b",
     r"\bCRC\b",
     r"\bDRAM_FATAL_INTERRUPT\b",
     # High-severity syslog levels 0/1/2 in tags like %AGENT-0-FOO:, %AGENT-1-FOO:, %AGENT-2-FOO:
