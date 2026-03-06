@@ -1776,18 +1776,16 @@ class PowerInputCheck(BaseCheck):
         ]
 
 
-# Configurable regex patterns for logging threshold errors check
-# Easy to add/modify/remove patterns without changing code logic
+# Regex patterns for "show logging threshold errors" check.
+# Add/remove rules by appending or deleting a line in the list below; matching is case-insensitive.
 LOGGING_THRESHOLD_ERROR_PATTERNS = [
-    # Memory / link error indicators
+    # Memory / link error /DRAM fatal interrupt indicators
     r"\bECC\b",
     r"\bCRC\b",
+    r"\bDRAM_FATAL_INTERRUPT\b",
     # High-severity syslog levels 0/1/2 in tags like %AGENT-0-FOO:, %AGENT-1-FOO:, %AGENT-2-FOO:
-    # Example: %AGENT-6-INITIALIZED: ...  (here 6 is the log level; we only match 0/1/2)
+    # (e.g. %AGENT-6-INITIALIZED uses level 6; we only match 0/1/2)
     r"%[A-Z0-9_-]+-[0-2]-[A-Z0-9_-]+:",
-    # Add more patterns here as needed, e.g.:
-    # r"\bFATAL\b",
-    # r"\bCRITICAL\b",
 ]
 
 
