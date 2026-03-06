@@ -1779,14 +1779,14 @@ class PowerInputCheck(BaseCheck):
 # Regex patterns for "show logging threshold errors" check.
 # Add/remove rules by appending or deleting a line in the list below; matching is case-insensitive.
 LOGGING_THRESHOLD_ERROR_PATTERNS = [
+    # High-severity syslog levels 0/1/2 in tags like %AGENT-0-FOO:, %AGENT-1-FOO:, %AGENT-2-FOO:
+    # (e.g. %AGENT-6-INITIALIZED uses level 6; we only match 0/1/2)
+    r"%[A-Z0-9_-]+-[0-2]-[A-Z0-9_-]+:",    
     # Memory / link error /DRAM fatal interrupt indicators
     # ECC: exclude "ecc" in IPv6 addresses (e.g. 93f:ecc) via negative lookbehind
     r"(?<!:)\bECC\b",
     r"\bCRC\b",
     r"\bDRAM_FATAL_INTERRUPT\b",
-    # High-severity syslog levels 0/1/2 in tags like %AGENT-0-FOO:, %AGENT-1-FOO:, %AGENT-2-FOO:
-    # (e.g. %AGENT-6-INITIALIZED uses level 6; we only match 0/1/2)
-    r"%[A-Z0-9_-]+-[0-2]-[A-Z0-9_-]+:",
 ]
 
 
