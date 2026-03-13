@@ -1158,7 +1158,8 @@ class CpuUsageCheck(BaseCheck):
                     summary="No processes with CPU usage greater than 99%.",
                 )
             ]
-        sev = Severity.WARN if any(v > 100 for _, v in offenders) else Severity.INFO
+        # Treat any process with CPU usage >= 100 as WARN; values between 99 and 100 remain INFO.
+        sev = Severity.WARN if any(v >= 100 for _, v in offenders) else Severity.INFO
         summary = f"{len(offenders)} process(es) with CPU usage > 99%."
         details = [f"{ln} (CPU={v})" for ln, v in offenders]
         return [
