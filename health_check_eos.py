@@ -265,6 +265,7 @@ class DeviceBrief:
     hostname: Optional[str]
     eos_version: Optional[str]
     hw_model: Optional[str]
+    serial_number: Optional[str]
     system_time: Optional[str]
     health: Severity
     warn_count: int
@@ -329,6 +330,7 @@ class TechSupportContext:
         self.total_mem: Optional[int] = None
         self.free_mem: Optional[int] = None
         self.system_time: Optional[str] = None
+        self.serial_number: Optional[str] = None
         self.platform_series: str = "other"  # 78xx / 75xx / 7368 / 7289 / 7388 / other
 
     # Access helpers -----------------------------------------------------
@@ -582,6 +584,7 @@ SHOW_VERSION_UPTIME_RE = re.compile(r"^\s*Uptime\s*:\s*(.+)$", re.IGNORECASE)
 SHOW_VERSION_MEM_RE = re.compile(
     r"^\s*(Total|Free)\s+memory\s*:\s*([0-9]+)\s*(\w+)?", re.IGNORECASE
 )
+SHOW_VERSION_SERIAL_RE = re.compile(r"^\s*Serial number:\s*(.+)$", re.IGNORECASE)
 
 SHOW_CLOCK_RE = re.compile(r"^(\S.+)$")
 
@@ -648,6 +651,15 @@ def parse_show_version(ctx: TechSupportContext) -> List[CheckResult]:
 
     ctx.total_mem = total_mem
     ctx.free_mem = free_mem
+
+    # Serial number: may appear in "show version" or "show version detail" block
+    for block in blocks:
+        for line in block.lines:
+            if m := SHOW_VERSION_SERIAL_RE.search(line):
+                ctx.serial_number = m.group(1).strip()
+                break
+        if ctx.serial_number is not None:
+            break
 
     results: List[CheckResult] = []
 
@@ -3062,6 +3074,7 @@ def make_device_brief(ctx: TechSupportContext, results: Sequence[CheckResult]) -
         hostname=ctx.hostname,
         eos_version=ctx.eos_version,
         hw_model=ctx.hw_model,
+        serial_number=ctx.serial_number,
         system_time=ctx.system_time,
         health=health,
         warn_count=warn,
@@ -3216,6 +3229,7 @@ def format_human_report(
         ["BRIEF", "Hostname", brief.hostname or "N/A", ""],
         ["BRIEF", "EOS version", brief.eos_version or "N/A", ""],
         ["BRIEF", "Model", brief.hw_model or "N/A", ""],
+        ["BRIEF", "Serial number", brief.serial_number or "N/A", ""],
         ["BRIEF", "System time", brief.system_time or "N/A", ""],
         [
             "BRIEF",
@@ -3719,6 +3733,7 @@ def format_json_report(
             "hostname": brief.hostname,
             "eos_version": brief.eos_version,
             "hw_model": brief.hw_model,
+            "serial_number": brief.serial_number,
             "system_time": brief.system_time,
             "health": brief.health.value,
             "warn_count": brief.warn_count,
