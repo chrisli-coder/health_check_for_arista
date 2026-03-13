@@ -279,8 +279,7 @@ class TechSupportParser:
     CMD_HEADER_RE = re.compile(r"^[-\s]+(?:show|bash).*[-\s]+$", re.IGNORECASE)
 
     @classmethod
-    def parse(cls, text: str) -> List[CommandBlock]:
-        lines = text.splitlines()
+    def parse_lines(cls, lines: Iterable[str]) -> List[CommandBlock]:
         blocks: List[CommandBlock] = []
         current_cmd: Optional[str] = None
         current_lines: List[str] = []
@@ -310,6 +309,11 @@ class TechSupportParser:
 
         flush_block()
         return blocks
+
+    @classmethod
+    def parse(cls, text: str) -> List[CommandBlock]:
+        """Backward-compatible parser that accepts a single text string."""
+        return cls.parse_lines(text.splitlines())
 
 
 class TechSupportContext:
@@ -396,7 +400,7 @@ def discover_showtech_members_from_archive(archive_path: Path) -> List[ArchiveSh
     members: List[ArchiveShowTechMember] = []
 
     def is_showtech(name_: str) -> bool:
-        base = os.path.basename(name_).lower()
+        base = Path(name_).name.lower()
         # Accept exact match or files containing show-tech/show-tech-support-all
         # Examples: "show-tech", "show-tech-support-all", 
         #           "localhost-show-tech-support-all-2026_02_08-07_29_38.log",
@@ -835,17 +839,20 @@ class CoolingStatusCheck(BaseCheck):
             # Command not present – silently skip this check
             return []
         lines = blocks[0].lines
-        text = "\n".join(lines)
         # Allow optional colon and capture rest of line as status.
-        m = re.search(
-            r"System\s+cooling\s+status\s+is\s*:?\s*(\S.*)$",
-            text,
-            re.IGNORECASE | re.MULTILINE,
-        )
-        if not m:
+        status: Optional[str] = None
+        for line in lines:
+            m = re.search(
+                r"System\s+cooling\s+status\s+is\s*:?\s*(\S.*)$",
+                line,
+                re.IGNORECASE,
+            )
+            if m:
+                status = m.group(1)
+                break
+        if status is None:
             # If format is unfamiliar, skip instead of emitting noisy INFO.
             return []
-        status = m.group(1)
         details: List[str] = []
         _maybe_add_debug_raw(details, "show system env cooling", lines)
         if status.lower() != "ok":
@@ -877,16 +884,19 @@ class TemperatureStatusCheck(BaseCheck):
             # Command not present – silently skip this check
             return []
         lines = blocks[0].lines
-        text = "\n".join(lines)
-        m = re.search(
-            r"System\s+temperature\s+status\s+is\s*:?\s*(\S.*)$",
-            text,
-            re.IGNORECASE | re.MULTILINE,
-        )
-        if not m:
+        status: Optional[str] = None
+        for line in lines:
+            m = re.search(
+                r"System\s+temperature\s+status\s+is\s*:?\s*(\S.*)$",
+                line,
+                re.IGNORECASE,
+            )
+            if m:
+                status = m.group(1)
+                break
+        if status is None:
             # If format is unfamiliar, skip instead of emitting noisy INFO.
             return []
-        status = m.group(1)
         details: List[str] = []
         _maybe_add_debug_raw(details, "show system env temperature", lines)
         if status.lower() != "ok":
@@ -1406,8 +1416,12 @@ class SandHealthCheck(BaseCheck):
                     summary="show platform sand health output not found.",
                 )
             ]
-        text = "\n".join(blocks[0].lines)
-        if re.search(r"fail|error|not\s+initial", text, re.IGNORECASE):
+        has_issue = False
+        for line in blocks[0].lines:
+            if re.search(r"fail|error|not\s+initial", line, re.IGNORECASE):
+                has_issue = True
+                break
+        if has_issue:
             sev = Severity.WARN
             summary = "Detected linecard/fabric initialization issues in sand health."
         else:
@@ -1429,6 +1443,13 @@ class FapFabricSerdesCheck(BaseCheck):
     category = "hardware"
     supported_platforms = ("78xx", "75xx")
 
+    PATTERN_78XX = re.compile(
+        r"(U--- Ramon|[|]---U Ramon|I---I? Ramon|[|]---I Ramon|[|]--- Ramon|---[|] Ramon)"
+    )
+    PATTERN_OTHER = re.compile(
+        r"(U--- Fe|[|]---U Fe|I---I? Fe|[|]---I Fe|[|]--- Fe|---[|] Fe)"
+    )
+
     def run(self, ctx: TechSupportContext) -> List[CheckResult]:
         blocks = ctx.get_blocks("show platform fap fabric detail")
         LOG.debug("fap_fabric_serdes check: found %d block(s) for 'show platform fap fabric detail'", len(blocks))
@@ -1442,20 +1463,15 @@ class FapFabricSerdesCheck(BaseCheck):
                 )
             ]
         lines = blocks[0].lines
-        if ctx.platform_series == "78xx":
-            # Pattern: U--- Ramon|---U Ramon|I--- Ramon|I---I Ramon|---I Ramon|\|--- Ramon|---\| Ramon
-            # Note: I---I Ramon is also a valid pattern (I---I followed by Ramon without space)
-            # In Python regex, \| matches literal |, so we use [|] or \| to match |
-            pattern = r"(U--- Ramon|[|]---U Ramon|I---I? Ramon|[|]---I Ramon|[|]--- Ramon|---[|] Ramon)"
-        else:
-            # Pattern: U--- Fe|---U Fe|I--- Fe|I---I Fe|---I Fe|\|--- Fe|---\| Fe
-            # Note: I---I Fe is also a valid pattern (I---I followed by Fe without space)
-            pattern = r"(U--- Fe|[|]---U Fe|I---I? Fe|[|]---I Fe|[|]--- Fe|---[|] Fe)"
-        
+        pattern = (
+            self.PATTERN_78XX
+            if ctx.platform_series == "78xx"
+            else self.PATTERN_OTHER
+        )
         # Find matching lines (output full lines like egrep)
         matched_lines = []
         for line in lines:
-            if re.search(pattern, line):
+            if pattern.search(line):
                 stripped = line.strip()
                 if stripped:
                     matched_lines.append(stripped)
@@ -2054,7 +2070,10 @@ class CpuQueueDropsCheck(BaseCheck):
         header_line_idx = None
         
         # Find header line and DropPkts column index
+        MAX_HEADER_SCAN = 50
         for idx, line in enumerate(lines):
+            if idx > MAX_HEADER_SCAN:
+                break
             stripped = line.strip()
             if not stripped:
                 continue
@@ -2184,7 +2203,10 @@ class InterfaceDiscardsCheck(BaseCheck):
         out_discards_col_idx = None
         header_line_idx = None
         
+        MAX_HEADER_SCAN = 50
         for idx, line in enumerate(lines):
+            if idx > MAX_HEADER_SCAN:
+                break
             stripped = line.strip()
             if not stripped:
                 continue
@@ -2293,7 +2315,10 @@ class InterfaceErrorsCheck(BaseCheck):
         error_col_indices = {}
         header_line_idx = None
         
+        MAX_HEADER_SCAN = 50
         for idx, line in enumerate(lines):
+            if idx > MAX_HEADER_SCAN:
+                break
             stripped = line.strip()
             if not stripped:
                 continue
@@ -2378,6 +2403,14 @@ class HardwareCounterDropCheck(BaseCheck):
     category = "hardware"
     supported_platforms = ("78xx", "75xx", "7289", "7388")
 
+    SUMMARY_A_RE = re.compile(
+        r"Total\s+Adverse\s*\(A\)\s*Drops:\s*(\d+)", re.IGNORECASE
+    )
+    SUMMARY_C_RE = re.compile(
+        r"Total\s+Congestion\s*\(C\)\s*Drops:\s*(\d+)", re.IGNORECASE
+    )
+    DATE_RE = re.compile(r"(\d{4}-\d{2}-\d{2}\s+\d{2}:\d{2}:\d{2})")
+
     def run(self, ctx: TechSupportContext) -> List[CheckResult]:
         blocks = ctx.get_blocks("show hardware counter drop")
         if not blocks:
@@ -2389,7 +2422,8 @@ class HardwareCounterDropCheck(BaseCheck):
                     summary="show hardware counter drop output not found.",
                 )
             ]
-        text = "\n".join(blocks[0].lines)
+        lines = blocks[0].lines
+        text = "\n".join(lines)
         if not ctx.system_time:
             # cannot compare date, just check presence of A/C drops
             if re.search(r"Adverse\s*\(A\)\s*Drops", text) or re.search(
@@ -2423,8 +2457,8 @@ class HardwareCounterDropCheck(BaseCheck):
             date_clock = dt_clock.date()
             
             # Check Summary section for total counts
-            summary_match_a = re.search(r"Total\s+Adverse\s*\(A\)\s*Drops:\s*(\d+)", text, re.IGNORECASE)
-            summary_match_c = re.search(r"Total\s+Congestion\s*\(C\)\s*Drops:\s*(\d+)", text, re.IGNORECASE)
+            summary_match_a = self.SUMMARY_A_RE.search(text)
+            summary_match_c = self.SUMMARY_C_RE.search(text)
             
             if summary_match_a:
                 try:
@@ -2460,9 +2494,7 @@ class HardwareCounterDropCheck(BaseCheck):
                     parts = stripped.split()
                     if len(parts) >= 6:
                         # Try to find date pattern in the line (YYYY-MM-DD HH:MM:SS)
-                        # Look for pattern matching date format
-                        date_pattern = r"(\d{4}-\d{2}-\d{2}\s+\d{2}:\d{2}:\d{2})"
-                        matches = re.findall(date_pattern, stripped)
+                        matches = self.DATE_RE.findall(stripped)
                         if matches:
                             # Last match should be Last Occurrence
                             last_occurrence_str = matches[-1]
@@ -2478,8 +2510,7 @@ class HardwareCounterDropCheck(BaseCheck):
                     # Parse the line to extract Last Occurrence date
                     parts = stripped.split()
                     if len(parts) >= 6:
-                        date_pattern = r"(\d{4}-\d{2}-\d{2}\s+\d{2}:\d{2}:\d{2})"
-                        matches = re.findall(date_pattern, stripped)
+                        matches = self.DATE_RE.findall(stripped)
                         if matches:
                             last_occurrence_str = matches[-1]
                             try:
@@ -2551,7 +2582,10 @@ class HardwareCapacityCheck(BaseCheck):
             m = re.search(r"(\d+)%\s*Used", line)
             if not m:
                 continue
-            val = int(m.group(1))
+            try:
+                val = int(m.group(1))
+            except ValueError:
+                continue
             if val > 90:
                 over.append((line.strip(), val))
         if over:
@@ -3193,7 +3227,7 @@ def _infer_command_from_check(check: CheckResult) -> Optional[str]:
         "fap_fabric_serdes": "show platform fap fabric detail",
         "redundancy_status": "show redundancy status",
         "pci_errors": "show pci",
-        "agent_crash_logs": "show agent logs crash",
+        "agent_logs_crash": "show agent logs crash",
         "power_input_voltage": "show system environment power detail",
         "logging_threshold_errors": "show logging threshold errors",
         "interfaces_queue_drops": "show interfaces counters queue drops",
@@ -3813,7 +3847,6 @@ def process_single_task(task: ProcessingTask) -> Tuple[str, str]:
         # Release text reference immediately after processing (if lazy-loaded)
         if text is not None and task.text is None:
             del text
-            gc.collect()
 
 
 def collect_processing_tasks(
@@ -3979,17 +4012,11 @@ def process_showtech_text(source_id: str, text: str, mode: str, as_json: bool, d
     else:
         report = format_human_report(ctx, brief, results, mode, debug, show_checks_in_brief)
     
-    # Explicitly release large objects to help garbage collection
-    # Note: Python's garbage collector will handle this, but explicit cleanup
-    # helps ensure memory is freed promptly, especially when processing multiple files
+    # Explicitly release large objects to help garbage collection.
     del blocks
     del ctx
     del results
     del brief
-    
-    # Force garbage collection for large objects
-    gc.collect()
-    
     return report
 
 
@@ -4060,11 +4087,9 @@ def main(argv: Optional[Sequence[str]] = None) -> None:
             outputs.append(report)
             # Release task text reference immediately after processing
             del task.text
-            gc.collect()
         
         # Clean up tasks list after sequential processing
         del tasks
-        gc.collect()
     else:
         # Parallel processing with thread pool
         if low_memory and len(tasks) > num_threads * 2:
@@ -4109,11 +4134,9 @@ def main(argv: Optional[Sequence[str]] = None) -> None:
                     # Clean up batch
                     del batch_results
                     del future_to_index
-                    gc.collect()
             
             # Clean up tasks list after all batches complete
             del tasks
-            gc.collect()
         else:
             # Standard parallel processing (all tasks at once)
             LOG.info("Processing %d file(s) using %d thread(s)...", len(tasks), num_threads)
@@ -4154,14 +4177,11 @@ def main(argv: Optional[Sequence[str]] = None) -> None:
             
             # Clean up tasks list after thread pool closes
             del tasks
-            # Force garbage collection after all tasks complete
-            gc.collect()
 
     final_output = "\n\n".join(outputs)
     
     # Release outputs list after creating final_output
     del outputs
-    gc.collect()
 
     if args.output:
         out_path = Path(args.output)
@@ -4170,7 +4190,6 @@ def main(argv: Optional[Sequence[str]] = None) -> None:
             LOG.info("Report written to: %s", out_path)
             # Release final_output after writing to file
             del final_output
-            gc.collect()
         except OSError as exc:
             LOG.error("Failed to write output to %s: %s", out_path, exc)
             print(final_output)
