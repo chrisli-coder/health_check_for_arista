@@ -31,8 +31,8 @@ from typing import Dict, Iterable, List, Optional, Sequence, Tuple
 
 __author__ = "chris.li@arista.com"
 __company__ = "Arista Networks"
-__last_modified__ = "2026-03-04"
-__version__ = "1.1.0"
+__last_modified__ = "2026-03-18"
+__version__ = "1.2.1"
 
 
 LOG = logging.getLogger("health_check_eos")
@@ -2467,6 +2467,9 @@ class HardwareCounterDropCheck(BaseCheck):
             dt_clock = _dt.datetime.strptime(clock, "%a %b %d %H:%M:%S %Y")
             date_clock = dt_clock.date()
             clock_parse_ok = True
+
+            _hcd_row_parse = {"A": {"same": 0, "other": 0}, "C": {"same": 0, "other": 0}}
+            _hcd_samples = {"A_same": [], "A_other": [], "C_same": [], "C_other": []}
             
             # Check Summary section for total counts
             summary_match_a = self.SUMMARY_A_RE.search(text)
@@ -2515,7 +2518,18 @@ class HardwareCounterDropCheck(BaseCheck):
                                 if dt_last.date() == date_clock:
                                     drop_same_day = True
                                     adverse_same_day_row_count += 1
+                                    _hcd_row_parse["A"]["same"] += 1
+                                    if len(_hcd_samples["A_same"]) < 3:
+                                        _hcd_samples["A_same"].append(
+                                            {"last": last_occurrence_str, "line": stripped[:140]}
+                                        )
                                     # Don't break, continue counting all rows
+                                else:
+                                    _hcd_row_parse["A"]["other"] += 1
+                                    if len(_hcd_samples["A_other"]) < 3:
+                                        _hcd_samples["A_other"].append(
+                                            {"last": last_occurrence_str, "line": stripped[:140]}
+                                        )
                             except (ValueError, Exception):
                                 continue
                 elif stripped.startswith("C "):
@@ -2531,9 +2545,21 @@ class HardwareCounterDropCheck(BaseCheck):
                                 if dt_last.date() == date_clock:
                                     drop_same_day = True
                                     congestion_same_day_row_count += 1
+                                    _hcd_row_parse["C"]["same"] += 1
+                                    if len(_hcd_samples["C_same"]) < 3:
+                                        _hcd_samples["C_same"].append(
+                                            {"last": last_occurrence_str, "line": stripped[:140]}
+                                        )
                                     # Don't break, continue counting all rows
+                                else:
+                                    _hcd_row_parse["C"]["other"] += 1
+                                    if len(_hcd_samples["C_other"]) < 3:
+                                        _hcd_samples["C_other"].append(
+                                            {"last": last_occurrence_str, "line": stripped[:140]}
+                                        )
                             except (ValueError, Exception):
                                 continue
+
         except Exception as e:
             clock_parse_error = str(e)
             LOG.debug(f"Failed to parse show clock time for hardware counter drop comparison: {e}")
@@ -3433,14 +3459,41 @@ def format_human_report(
                             continue
                         if stripped.startswith("A ") or stripped.startswith("C "):
                             filtered_lines.append(stripped)
+
+                # Compute same-day filtered candidates for debugging (do not change output yet)
+                _same_day_lines: List[str] = []
+                _clock_raw = getattr(ctx, "system_time", None)
+                _clock_ok = False
+                if _clock_raw:
+                    try:
+                        _dt_clock = _dt.datetime.strptime(_clock_raw, "%a %b %d %H:%M:%S %Y")
+                        _clock_date = _dt_clock.date()
+                        _clock_ok = True
+                        date_re = re.compile(r"(\d{4}-\d{2}-\d{2}\s+\d{2}:\d{2}:\d{2})")
+                        for _ln in filtered_lines:
+                            _matches = date_re.findall(_ln)
+                            if not _matches:
+                                continue
+                            _last = _matches[-1]
+                            try:
+                                _dt_last = _dt.datetime.strptime(_last, "%Y-%m-%d %H:%M:%S")
+                                if _dt_last.date() == _clock_date:
+                                    _same_day_lines.append(_ln)
+                            except Exception:
+                                continue
+                    except Exception:
+                        pass
                 content: List[str] = []
                 if summary_lines:
                     content.extend(summary_lines)
                     content.append("")
                 if header_line:
                     content.append(header_line)
-                if filtered_lines:
-                    content.extend(filtered_lines)
+                # Bugfix: Align full output with WARN summary semantics (same-day as show clock).
+                # When system time is available and parsed, show same-day A/C rows only.
+                _final_lines = _same_day_lines if _clock_ok else filtered_lines
+                if _final_lines:
+                    content.extend(_final_lines)
                 else:
                     content.append("(No A or C type drops found)")
                 return content
