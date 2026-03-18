@@ -26,8 +26,9 @@ This tool analyzes Arista EOS show-tech / show-tech-support-all outputs and rela
 
 - **Output Modes**:
   - Brief mode: Summary with key information (hostname, version, model, system time, health status)
+  - Summary mode: One-line output for all checks (no details)
   - Warn-only mode: Brief summary plus all WARN-severity check results
-  - Verbose mode: Detailed output for all checked items
+  - Verbose mode: Per-check output limited to first 10 lines (to avoid flooding)
   - Debug mode: Full raw command outputs for troubleshooting
   - JSON mode: Machine-readable JSON format
 
@@ -76,8 +77,9 @@ python3 health_check_eos.py file1 file2 directory1 archive.zip
 #### Output Modes
 
 - `-b, --brief`: Brief report mode (default)
+- `-v, --summary`: Summary report mode (one-line output for all checks, no details)
 - `-w, --warn-only`: Warn-only mode (brief summary + all WARN-severity checks)
-- `-v, --verbose`: Verbose report mode (includes all check details)
+- `-V, --verbose`: Verbose report mode (per-check output limited to first 10 lines)
 - `-d, --debug`: Enable debug logging and show full raw outputs
 - `-j, --json`: Output report in JSON format
 
@@ -89,10 +91,10 @@ python3 health_check_eos.py file1 file2 directory1 archive.zip
 
 - `-l, --list-checks`: List all supported health checks and exit
 - `-c [CHECK_NAME ...], --show-checks-in-brief [CHECK_NAME ...]`: 
-  - Show specified checks in brief mode output
+  - Show specified checks in brief mode output (full output for selected checks, not truncated)
   - If no check names provided, shows all supported checks list
   - Use `--list-checks` to see available check names
-  - **Using `-c` automatically enables debug mode (`-d`)** for easier troubleshooting
+  - `-c` no longer automatically enables debug mode (`-d`)
 - `-s CHECK_NAME [CHECK_NAME ...], --skip-checks CHECK_NAME [CHECK_NAME ...]`:
   - Skip specified checks during execution
   - Can specify multiple check names to skip
@@ -131,7 +133,7 @@ python3 health_check_eos.py -l
 python3 health_check_eos.py --list-checks
 
 # Verbose mode with detailed output
-python3 health_check_eos.py -v /path/to/show-tech
+python3 health_check_eos.py -V /path/to/show-tech
 # or
 python3 health_check_eos.py --verbose /path/to/show-tech
 
@@ -258,8 +260,13 @@ Brief mode displays a summary table with:
 
 Verbose mode includes:
 - All information from brief mode
-- Detailed output for all checked items
-- Summary and important lines/columns (limited to avoid excessive output)
+- Per-check output limited to the first 10 lines (to avoid excessive output)
+
+### Summary Mode
+
+Summary mode includes:
+- All information from brief mode
+- One-line output for all checks (no details)
 
 ### Debug Mode
 
@@ -384,7 +391,7 @@ Use `-l` or `--list-checks` to see all supported checks with their commands and 
 
 ### View Specific Checks
 
-Use `-c` or `--show-checks-in-brief` to view details of specific checks in brief mode. Debug mode (`-d`) is automatically enabled when you use `-c`, so you will also see processing logs and full raw outputs.
+Use `-c` or `--show-checks-in-brief` to view full output of specific checks in brief mode (not truncated). `-c` no longer automatically enables debug mode (`-d`).
 
 ## Notes
 

@@ -55,7 +55,7 @@ def build_arg_parser() -> argparse.ArgumentParser:
         epilog=(
             "Examples:\n"
             "  %(prog)s /path/to/show-tech                    # Basic analysis\n"
-            "  %(prog)s -v /path/to/show-tech                 # Verbose mode\n"
+            "  %(prog)s -V /path/to/show-tech                 # Verbose mode\n"
             "  %(prog)s -d /path/to/show-tech                # Debug mode\n"
             "  %(prog)s -j -o report.json /path/to/show-tech  # JSON output\n"
             "  %(prog)s -l                                   # List all checks\n"
@@ -92,10 +92,16 @@ def build_arg_parser() -> argparse.ArgumentParser:
         help="Write report to FILE instead of stdout.",
     )
     output_group.add_argument(
-        "-v",
+        "-V",
         "--verbose",
         action="store_true",
         help="Verbose report mode (includes all check details).",
+    )
+    output_group.add_argument(
+        "-v",
+        "--summary",
+        action="store_true",
+        help="Summary report mode: one-line output for all checks (no details).",
     )
     output_group.add_argument(
         "-b",
@@ -205,19 +211,18 @@ def parse_args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
     args = parser.parse_args(argv)
 
     # Resolve output mode:
+    # - summary overrides other modes
     # - verbose overrides other modes
     # - warn-only shows brief summary plus all WARN-severity checks
     # - default is brief
-    if args.verbose:
+    if getattr(args, "summary", False):
+        args.mode = "summary"
+    elif args.verbose:
         args.mode = "verbose"
     elif getattr(args, "warn_only", False):
         args.mode = "warn"
     else:
         args.mode = "brief"
-
-    # When -c (show-checks-in-brief) is used, automatically enable debug mode.
-    if args.show_checks_in_brief is not None:
-        args.debug = True
 
     return args
 
@@ -2423,6 +2428,7 @@ class HardwareCounterDropCheck(BaseCheck):
                     summary="show hardware counter drop output not found.",
                 )
             ]
+
         lines = blocks[0].lines
         text = "\n".join(lines)
         if not ctx.system_time:
@@ -2451,11 +2457,16 @@ class HardwareCounterDropCheck(BaseCheck):
         has_congestion_drops = False
         adverse_row_count = 0
         congestion_row_count = 0
+        adverse_same_day_row_count = 0
+        congestion_same_day_row_count = 0
+        clock_parse_ok = False
+        clock_parse_error = None
         
         try:
             # Example: Thu Jan 29 23:10:00 2026
             dt_clock = _dt.datetime.strptime(clock, "%a %b %d %H:%M:%S %Y")
             date_clock = dt_clock.date()
+            clock_parse_ok = True
             
             # Check Summary section for total counts
             summary_match_a = self.SUMMARY_A_RE.search(text)
@@ -2503,6 +2514,7 @@ class HardwareCounterDropCheck(BaseCheck):
                                 dt_last = _dt.datetime.strptime(last_occurrence_str, "%Y-%m-%d %H:%M:%S")
                                 if dt_last.date() == date_clock:
                                     drop_same_day = True
+                                    adverse_same_day_row_count += 1
                                     # Don't break, continue counting all rows
                             except (ValueError, Exception):
                                 continue
@@ -2518,19 +2530,21 @@ class HardwareCounterDropCheck(BaseCheck):
                                 dt_last = _dt.datetime.strptime(last_occurrence_str, "%Y-%m-%d %H:%M:%S")
                                 if dt_last.date() == date_clock:
                                     drop_same_day = True
+                                    congestion_same_day_row_count += 1
                                     # Don't break, continue counting all rows
                             except (ValueError, Exception):
                                 continue
         except Exception as e:
+            clock_parse_error = str(e)
             LOG.debug(f"Failed to parse show clock time for hardware counter drop comparison: {e}")
 
         # Alert if we have A or C drops AND at least one has Last Occurrence on same day
         if drop_same_day and (has_adverse_drops or has_congestion_drops):
             summary_parts = []
             if has_adverse_drops:
-                summary_parts.append(f"A drops: {adverse_row_count} row(s)")
+                summary_parts.append(f"A same-day rows: {adverse_same_day_row_count}")
             if has_congestion_drops:
-                summary_parts.append(f"C drops: {congestion_row_count} row(s)")
+                summary_parts.append(f"C same-day rows: {congestion_same_day_row_count}")
             summary_suffix = f" ({', '.join(summary_parts)})" if summary_parts else ""
             return [
                 CheckResult(
@@ -2544,9 +2558,9 @@ class HardwareCounterDropCheck(BaseCheck):
         # Build OK summary with row counts
         summary_parts = []
         if adverse_row_count > 0:
-            summary_parts.append(f"A drops: {adverse_row_count} row(s)")
+            summary_parts.append(f"A rows: {adverse_row_count}")
         if congestion_row_count > 0:
-            summary_parts.append(f"C drops: {congestion_row_count} row(s)")
+            summary_parts.append(f"C rows: {congestion_row_count}")
         summary_suffix = f" ({', '.join(summary_parts)})" if summary_parts else ""
         return [
             CheckResult(
@@ -3254,6 +3268,206 @@ def format_human_report(
     debug: bool = False,
     show_checks_in_brief: Optional[List[str]] = None,
 ) -> str:
+    def _selected_check_names() -> Optional[List[str]]:
+        if show_checks_in_brief is None:
+            return None
+        if len(show_checks_in_brief) == 0:
+            return []
+        return list(show_checks_in_brief)
+
+    def _is_selected(result_name: str, selected: Sequence[str]) -> bool:
+        for n in selected:
+            if result_name == n or result_name.startswith(n + "_"):
+                return True
+        return False
+
+    def _append_raw_or_filtered_output(
+        out_lines: List[str],
+        r: CheckResult,
+        *,
+        limit: Optional[int],
+    ) -> None:
+        """
+        Append raw (or filtered) output for a check.
+        If limit is None -> full output; else -> only first N lines.
+        """
+        cmd = r.command or _infer_command_from_check(r)
+        if not cmd:
+            # Fallback to details when we can't map to a command.
+            details = [d for d in r.details if not d.startswith("[DEBUG raw")]
+            if not details:
+                out_lines.append("  (No output available)")
+                return
+            snippet = details if limit is None else details[:limit]
+            for d in snippet:
+                out_lines.append(f"  {d}")
+            if limit is not None and len(details) > limit:
+                out_lines.append(f"  ... (showing first {limit} line(s))")
+            return
+
+        blocks = ctx.get_blocks(cmd)
+        if not blocks:
+            out_lines.append("  (No output available)")
+            return
+        raw_lines = blocks[0].lines
+
+        def compute_content_lines() -> List[str]:
+            # Reuse the same filtering intent as debug mode.
+            if r.name == "fap_fabric_serdes":
+                if ctx.platform_series == "78xx":
+                    pattern = r"(U--- Ramon|[|]---U Ramon|I---I? Ramon|[|]---I Ramon|[|]--- Ramon|---[|] Ramon)"
+                else:
+                    pattern = r"(U--- Fe|[|]---U Fe|I---I? Fe|[|]---I Fe|[|]--- Fe|---[|] Fe)"
+                return [ln for ln in raw_lines if re.search(pattern, ln)] or [
+                    "(No lines matched the pattern)"
+                ]
+
+            if r.name == "logging_threshold_errors":
+                patterns = LOGGING_THRESHOLD_ERROR_PATTERNS
+                matching_lines = []
+                for ln in raw_lines:
+                    for pat in patterns:
+                        if re.search(pat, ln, re.IGNORECASE):
+                            matching_lines.append(ln)
+                            break
+                return matching_lines or ["(No lines matched the patterns)"]
+
+            if r.name == "interfaces_queue_drops":
+                # Prefer parsed details (already header + matched lines)
+                if r.details:
+                    return list(r.details)
+                header_line, matched_lines = _parse_queue_drops_output(raw_lines)
+                content: List[str] = []
+                if header_line:
+                    content.append(header_line)
+                if matched_lines:
+                    content.extend(matched_lines)
+                else:
+                    content.append("(No matched lines found)")
+                return content
+
+            if r.name == "interfaces_errors":
+                header_line = None
+                header_line_idx = None
+                non_zero_lines = []
+                for idx, ln in enumerate(raw_lines):
+                    stripped = ln.strip()
+                    if not stripped:
+                        continue
+                    if stripped.replace("-", "").replace("|", "").strip() == "":
+                        continue
+                    parts_lower = [p.lower() for p in stripped.split()]
+                    error_keywords = [
+                        "error",
+                        "crc",
+                        "alignment",
+                        "fcs",
+                        "frame",
+                        "overrun",
+                        "underrun",
+                        "collision",
+                    ]
+                    if any(keyword in " ".join(parts_lower) for keyword in error_keywords):
+                        header_line = stripped
+                        header_line_idx = idx
+                        break
+                if header_line_idx is not None:
+                    for ln in raw_lines[header_line_idx + 1 :]:
+                        stripped = ln.strip()
+                        if not stripped:
+                            continue
+                        if stripped.replace("-", "").replace("|", "").strip() == "":
+                            continue
+                        parts = stripped.split()
+                        has_non_zero = False
+                        for i in range(1, len(parts)):
+                            try:
+                                val = int(parts[i].replace(",", "").strip())
+                                if val != 0:
+                                    has_non_zero = True
+                                    break
+                            except (ValueError, IndexError):
+                                continue
+                        if has_non_zero:
+                            non_zero_lines.append(stripped)
+                content: List[str] = []
+                if header_line:
+                    content.append(header_line)
+                if non_zero_lines:
+                    content.extend(non_zero_lines)
+                else:
+                    content.append("(No non-zero error counters found)")
+                return content
+
+            if r.name == "hardware_counter_drop":
+                header_line = None
+                header_line_idx = None
+                filtered_lines = []
+                for idx, ln in enumerate(raw_lines):
+                    stripped = ln.strip()
+                    if not stripped:
+                        continue
+                    if stripped.replace("-", "").replace("|", "").strip() == "":
+                        continue
+                    if "Last Occurrence" in stripped:
+                        header_line = stripped
+                        header_line_idx = idx
+                        break
+                summary_lines = []
+                for ln in raw_lines:
+                    stripped = ln.strip()
+                    if not stripped:
+                        continue
+                    if (
+                        stripped.startswith("Summary:")
+                        or "Total Adverse" in stripped
+                        or "Total Congestion" in stripped
+                    ):
+                        summary_lines.append(stripped)
+                if header_line_idx is not None:
+                    for ln in raw_lines[header_line_idx + 1 :]:
+                        stripped = ln.strip()
+                        if not stripped:
+                            continue
+                        if stripped.replace("-", "").replace("|", "").strip() == "":
+                            continue
+                        if stripped.startswith("A ") or stripped.startswith("C "):
+                            filtered_lines.append(stripped)
+                content: List[str] = []
+                if summary_lines:
+                    content.extend(summary_lines)
+                    content.append("")
+                if header_line:
+                    content.append(header_line)
+                if filtered_lines:
+                    content.extend(filtered_lines)
+                else:
+                    content.append("(No A or C type drops found)")
+                return content
+
+            # Default: no filtering, use full raw output.
+            return list(raw_lines)
+
+        content_lines = compute_content_lines()
+
+        # For full output (used by -c override), output all content lines.
+        if limit is None:
+            out_lines.append(f"[OUTPUT {cmd}]")
+            out_lines.append("-" * 80)
+            out_lines.extend(content_lines)
+            out_lines.append("-" * 80)
+            return
+
+        # Preview output (used by verbose/warn-only): first N lines (filtered when applicable).
+        snippet = content_lines[:limit]
+        if not snippet:
+            out_lines.append("  (No output available)")
+            return
+        for ln in snippet:
+            out_lines.append(f"  {ln}")
+        if len(content_lines) > limit:
+            out_lines.append(f"  ... (showing first {limit} line(s))")
+
     lines: List[str] = []
     lines.append(f"Source: {ctx.source_id}")
     lines.append("")
@@ -3277,43 +3491,46 @@ def format_human_report(
     # Brief table is always the same regardless of mode
     widths = _compute_col_widths(headers, brief_rows)
     lines.extend(_ascii_table_with_widths(headers, brief_rows, widths))
+
+    # Summary mode: one-line output for all checks, no details/raw
+    if mode == "summary":
+        lines.append("")
+        lines.append("Checks summary:")
+        lines.append("-" * 80)
+        for idx, r in enumerate(results):
+            if idx:
+                lines.append("")
+            lines.append(f"[{r.severity.value}] {r.category}/{r.name}: {r.summary}")
+        lines.append("-" * 80)
+        return "\n".join(lines)
     
     # Add checks information in brief mode if requested
-    if mode == "brief" and show_checks_in_brief is not None:
+    selected_names = _selected_check_names()
+    if mode == "brief" and selected_names is not None:
         lines.append("")
-        if len(show_checks_in_brief) == 0:
+        if len(selected_names) == 0:
             # No check names specified: show all supported checks list
             lines.append(format_checks_list())
         else:
-            # Show specified checks details
-            lines.append("Selected Checks Details:")
+            # Show specified checks full output (not truncated)
+            lines.append("Selected checks (full output):")
             lines.append("=" * 80)
-            for check_name in show_checks_in_brief:
-                # Find all matching check results (exact match or prefix match)
-                # This handles cases where a check returns multiple results with suffixes
-                # (e.g., redundancy_status -> redundancy_status_active_unit, redundancy_status_protocol)
-                matching_results = []
+            for check_name in selected_names:
+                matching_results: List[CheckResult] = []
                 for r in results:
                     if r.name == check_name or r.name.startswith(check_name + "_"):
                         matching_results.append(r)
-                
-                if matching_results:
-                    for check_result in matching_results:
-                        lines.append("")
-                        lines.append(f"Check: {check_result.category}/{check_result.name}")
-                        lines.append(f"Status: {check_result.severity.value}")
-                        lines.append(f"Summary: {check_result.summary}")
-                        if check_result.details:
-                            lines.append("Details:")
-                            for detail in check_result.details[:5]:  # Limit to first 5 details
-                                if not detail.startswith("[DEBUG"):
-                                    lines.append(f"  {detail}")
-                            if len(check_result.details) > 5:
-                                lines.append(f"  ... and {len(check_result.details) - 5} more item(s)")
-                        lines.append("-" * 80)
-                else:
+
+                if not matching_results:
                     lines.append("")
                     lines.append(f"Check: {check_name} (not found or not executed)")
+                    lines.append("-" * 80)
+                    continue
+
+                for check_result in matching_results:
+                    lines.append("")
+                    lines.append(f"[{check_result.severity.value}] {check_result.category}/{check_result.name}: {check_result.summary}")
+                    _append_raw_or_filtered_output(lines, check_result, limit=None)
                     lines.append("-" * 80)
     
     # In brief mode without debug, return early
@@ -3356,23 +3573,17 @@ def format_human_report(
         if not (mode == "brief" and debug and show_checks_in_brief is not None and len(show_checks_in_brief) > 0):
             lines.append(f"[{r.severity.value}] {r.category}/{r.name}: {r.summary}")
             
-            # In verbose mode, limit details to avoid excessive output
-            # Show only summary and important lines (max 10 details)
-            # Exception: inventory check should not show details in verbose mode
+            # verbose / warn-only (non-debug): show first 10 lines for every result
             if mode in ("verbose", "warn") and not debug:
-                if r.name == "inventory":
-                    # Skip details for inventory check in verbose mode
-                    pass
+                selected_for_full = (
+                    selected_names is not None
+                    and len(selected_names) > 0
+                    and _is_selected(r.name, selected_names)
+                )
+                if selected_for_full:
+                    _append_raw_or_filtered_output(lines, r, limit=None)
                 else:
-                    max_details = 10
-                    filtered_details = [d for d in r.details if not d.startswith("[DEBUG raw")]
-                    if len(filtered_details) > max_details:
-                        for d in filtered_details[:max_details]:
-                            lines.append(f"  {d}")
-                        lines.append(f"  ... and {len(filtered_details) - max_details} more item(s)")
-                    else:
-                        for d in filtered_details:
-                            lines.append(f"  {d}")
+                    _append_raw_or_filtered_output(lines, r, limit=10)
             elif debug:
                 # In debug mode, show all details (except legacy debug raw)
                 for d in r.details:
