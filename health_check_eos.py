@@ -2404,6 +2404,89 @@ class InterfaceErrorsCheck(BaseCheck):
 
 
 @register_check
+class InterfaceErrdisabledCheck(BaseCheck):
+    name = "interfaces_errdisabled"
+    category = "interface"
+    supported_platforms = ("all",)
+
+    def run(self, ctx: TechSupportContext) -> List[CheckResult]:
+        blocks = ctx.get_blocks("show interfaces status errdisabled")
+        if not blocks:
+            return [
+                CheckResult(
+                    name=self.name,
+                    category=self.category,
+                    severity=Severity.INFO,
+                    summary="show interfaces status errdisabled output not found.",
+                )
+            ]
+
+        lines = blocks[0].lines
+
+        # Robust parsing:
+        # - EOS output is usually already filtered to errdisabled interfaces,
+        #   but interface-name prefix formats vary across platforms/versions.
+        # - Therefore we treat any non-header data line containing keyword
+        #   `errdisabled` as an offender.
+        offenders: List[str] = []
+        for line in lines:
+            stripped = line.strip()
+            if not stripped:
+                continue
+
+            # Skip table separator / border lines.
+            if stripped.replace("-", "").replace("=", "").replace("|", "").strip() == "":
+                continue
+
+            lower = stripped.lower()
+
+            # Skip likely header lines.
+            # (We only need to identify data rows; header formats vary by platform/versions.)
+            if "port" in lower and ("status" in lower or "reason" in lower or "name" in lower):
+                continue
+            if lower.startswith("no ") and ("errdisabled" in lower or "err-disabled" in lower):
+                continue
+
+            # Skip "No err-disabled..." summary line.
+            if lower.startswith("no ") and ("err-disabled" in lower or "errdisabled" in lower):
+                # Example: "No err-disabled interfaces found"
+                continue
+
+            if "errdisabled" in lower:
+                offenders.append(stripped)
+
+        # cap details to avoid flooding debug output when many interfaces are affected
+        MAX_DETAILS = 200
+        details: List[str]
+        if offenders:
+            details = offenders[:MAX_DETAILS]
+            if len(offenders) > MAX_DETAILS:
+                details.append(
+                    f"... ({len(offenders) - MAX_DETAILS} more line(s) truncated)"
+                )
+            return [
+                CheckResult(
+                    name=self.name,
+                    category=self.category,
+                    severity=Severity.WARN,
+                    summary=f"Errdisabled interfaces present ({len(offenders)} interface(s)).",
+                    details=details,
+                    command="show interfaces status errdisabled",
+                )
+            ]
+
+        return [
+            CheckResult(
+                name=self.name,
+                category=self.category,
+                severity=Severity.OK,
+                summary="No errdisabled interfaces found.",
+                command="show interfaces status errdisabled",
+            )
+        ]
+
+
+@register_check
 class HardwareCounterDropCheck(BaseCheck):
     name = "hardware_counter_drop"
     category = "hardware"
@@ -3275,6 +3358,7 @@ def _infer_command_from_check(check: CheckResult) -> Optional[str]:
         "cpu_queue_drops": "show cpu counters queue",
         "interfaces_discards": "show interfaces counters discards",
         "interfaces_errors": "show interfaces counters errors",
+        "interfaces_errdisabled": "show interfaces status errdisabled",
         "hardware_counter_drop": "show hardware counter drop",
         "hardware_capacity": "show hardware capacity",
         "system_health_storage": "show system health storage",

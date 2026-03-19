@@ -233,6 +233,7 @@ The tool performs various health checks organized by category:
 - `show interfaces counters queue drops`: Interface queue drops
 - `show interfaces counters discards`: Interface discards
 - `show interfaces counters errors`: Interface errors
+- `show interfaces status errdisabled`: Errdisabled interfaces
 - `show cpu counters queue`: CPU queue drops
 
 ### System Logs
