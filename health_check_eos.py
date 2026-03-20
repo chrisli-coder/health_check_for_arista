@@ -4506,6 +4506,10 @@ def main(argv: Optional[Sequence[str]] = None) -> None:
     )
     
     if not tasks:
+        # For -L / -r extraction modes, returning success is misleading.
+        if args.list_showtech_commands or args.raw_command is not None:
+            print("error: no show-tech/show-tech-support-all files found for -L/-r under given PATH", file=sys.stderr)
+            sys.exit(1)
         LOG.warning("No show-tech files found to process.")
         return
 
@@ -4523,6 +4527,8 @@ def main(argv: Optional[Sequence[str]] = None) -> None:
             except OSError as exc:
                 LOG.error("Failed to write output to %s: %s", out_path, exc)
                 print(extract_out)
+                # Ensure write failures are visible to automation (do not keep original ec=0).
+                ec = max(ec, 1)
         else:
             print(extract_out)
         sys.exit(ec)
