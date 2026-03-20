@@ -4,7 +4,7 @@ A comprehensive health check tool for analyzing Arista EOS device show-tech file
 
 **Author**: chris.li@arista.com  
 **Company**: Arista Networks  
-**Last Modified**: 2026-03-18
+**Last Modified**: 2026-03-20
 
 ## Description
 
@@ -31,6 +31,10 @@ This tool analyzes Arista EOS show-tech / show-tech-support-all outputs and rela
   - Verbose mode: Per-check output limited to first 10 lines (to avoid flooding)
   - Debug mode: Full raw command outputs for troubleshooting
   - JSON mode: Machine-readable JSON format
+
+- **Show-tech command introspection** (no health checks run):
+  - `-L / --list-showtech-commands`: List each **bundle** command section in parse order (`------------- show … -------------` / `------------- bash … -------------`). In-output dashed headings (e.g. table titles) are ignored.
+  - `-r / --raw COMMAND`: Print the full captured output for that command (case-insensitive; exact match first, then prefix). Quote multi-word commands.
 
 - **Comprehensive Health Checks**:
   - System information (version, uptime, memory, temperature, cooling)
@@ -70,6 +74,12 @@ python3 health_check_eos.py /path/to/support-bundle.zip
 
 # Analyze multiple inputs
 python3 health_check_eos.py file1 file2 directory1 archive.zip
+
+# List every command section in a show-tech file (section headers only)
+python3 health_check_eos.py -L /path/to/show-tech
+
+# Dump the raw output of one section (quote the command if it contains spaces)
+python3 health_check_eos.py -r "show version" /path/to/show-tech
 ```
 
 ### Command Line Options
@@ -85,11 +95,14 @@ python3 health_check_eos.py file1 file2 directory1 archive.zip
 
 #### Output Control
 
-- `-o FILE, --output FILE`: Write report to FILE instead of stdout
+- `-o FILE, --output FILE`: Write report (or `-L` / `-r` extract output) to FILE instead of stdout
 
 #### Information and Filtering
 
 - `-l, --list-checks`: List all supported health checks and exit
+- `-L, --list-showtech-commands`: List all command section headers from the show-tech input(s) in order and exit (requires PATH; does not run health checks). Mutually exclusive with `-r` / `--raw`.
+- `-r COMMAND, --raw COMMAND`: Dump the raw text captured for `COMMAND` and exit (requires PATH; does not run health checks). Matching is case-insensitive: exact normalized command first, otherwise prefix match over sections in file order. If the same command appears multiple times, every matching section is printed with `match i/n` headers. Exit code `1` if a given input has no matching section. Mutually exclusive with `-L`.
+
 - `-c [CHECK_NAME ...], --show-checks-in-brief [CHECK_NAME ...]`: 
   - Show specified checks in brief mode output (full output for selected checks, not truncated)
   - If no check names provided, shows all supported checks list

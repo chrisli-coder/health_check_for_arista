@@ -31,8 +31,8 @@ from typing import Dict, Iterable, List, Optional, Sequence, Tuple
 
 __author__ = "chris.li@arista.com"
 __company__ = "Arista Networks"
-__last_modified__ = "2026-03-18"
-__version__ = "1.2.1"
+__last_modified__ = "2026-03-20"
+__version__ = "1.2.5"
 
 
 LOG = logging.getLogger("health_check_eos")
@@ -65,6 +65,8 @@ def build_arg_parser() -> argparse.ArgumentParser:
             "  %(prog)s -s cpu_usage_top -S hardware /path/to/show-tech  # Combine options\n"
             "  %(prog)s -t 4 *.zip                           # Process archives with 4 threads\n"
             "  %(prog)s -t 1 /path/to/show-tech              # Disable parallel processing\n"
+            "  %(prog)s -L /path/to/show-tech                # List command sections in show-tech\n"
+            "  %(prog)s -r \"show version\" /path/to/show-tech # Dump raw output of one section\n"
             "\n"
             "Author  : %(author)s\n"
             "Company : %(company)s\n"
@@ -80,7 +82,7 @@ def build_arg_parser() -> argparse.ArgumentParser:
             "One or more inputs: show-tech/show-tech-support-all file, "
             "unpacked support-bundle directory, or support-bundle archive "
             "(tar/tar.gz/tgz/zip). Type is detected automatically. "
-            "Not required when using --list-checks."
+            "Not required only when using --list-checks (-L / -r require PATH)."
         ),
     )
 
@@ -136,6 +138,28 @@ def build_arg_parser() -> argparse.ArgumentParser:
         "--list-checks",
         action="store_true",
         help="List all supported health checks and exit.",
+    )
+    showtech_extract = debug_group.add_mutually_exclusive_group()
+    showtech_extract.add_argument(
+        "-L",
+        "--list-showtech-commands",
+        action="store_true",
+        help=(
+            "List command section headers from the show-tech input(s) in file order and exit. "
+            "Requires PATH. Does not run health checks."
+        ),
+    )
+    showtech_extract.add_argument(
+        "-r",
+        "--raw",
+        dest="raw_command",
+        metavar="COMMAND",
+        default=None,
+        help=(
+            "Dump the raw body of COMMAND from the show-tech input(s) and exit. "
+            "Matching is case-insensitive: exact command first, else prefix. "
+            "Quote multi-word commands. Requires PATH. Does not run health checks."
+        ),
     )
     debug_group.add_argument(
         "-c",
@@ -280,8 +304,27 @@ class DeviceBrief:
 class TechSupportParser:
     """Parse a show-tech / show-tech-support-all text into command blocks."""
 
-    # Match lines like: ------------- show version ------------- or ------------- bash ls -ltr /var/core -------------
-    CMD_HEADER_RE = re.compile(r"^[-\s]+(?:show|bash).*[-\s]+$", re.IGNORECASE)
+    # Match section headers: ------------- command text ------------- (EOS show-tech / support-bundle)
+    _CMD_HEADER_RE = re.compile(r"^[-]{3,}\s*(.+?)\s*[-]{3,}\s*$")
+
+    @classmethod
+    def _header_command(cls, line: str) -> Optional[str]:
+        m = cls._CMD_HEADER_RE.match(line.rstrip("\r\n"))
+        if not m:
+            return None
+        cmd = m.group(1).strip()
+        if not cmd:
+            return None
+        # Reject pure dash/table-decoration lines (regex can treat a lone "-" as the "command").
+        if not any(c.isalnum() for c in cmd):
+            return None
+        low = cmd.lower()
+        # Real show-tech section titles are CLI lines: "show ..." or "bash ...". Dashed
+        # in-output headings (e.g. "------------- BSR Border Information -------------")
+        # are not bundle section boundaries.
+        if not (low.startswith("show") or low.startswith("bash")):
+            return None
+        return low
 
     @classmethod
     def parse_lines(cls, lines: Iterable[str]) -> List[CommandBlock]:
@@ -297,20 +340,13 @@ class TechSupportParser:
             current_lines = []
 
         for raw in lines:
-            if cls.CMD_HEADER_RE.match(raw):
-                # New command block header
+            hdr_cmd = cls._header_command(raw)
+            if hdr_cmd is not None:
                 flush_block()
-                # Normalise header to extract command name approx after the leading dashes.
-                # Example: "------------- show version -------------" or "------------- bash ls -ltr /var/core -------------"
-                cmd = raw.strip("- ").strip()
-                # Try to match "show ..." or "bash ..." commands
-                m = re.search(r"((?:show|bash).*)$", cmd, re.IGNORECASE)
-                if m:
-                    cmd = m.group(1).strip()
-                current_cmd = cmd.lower()
+                current_cmd = hdr_cmd
             else:
                 if current_cmd is not None:
-                    current_lines.append(raw.rstrip("\n"))
+                    current_lines.append(raw.rstrip("\r\n"))
 
         flush_block()
         return blocks
@@ -4158,6 +4194,76 @@ class ProcessingTask:
     lazy_archive_spec: Optional[ArchiveShowTechMember] = None  # For archive members
 
 
+def load_task_text(task: ProcessingTask) -> str:
+    """Load show-tech text for a task (pre-loaded, plain file, or archive member)."""
+    if task.text is not None:
+        return task.text
+    if task.lazy_path is not None:
+        return task.lazy_path.read_text(encoding="utf-8", errors="replace")
+    if task.lazy_archive_path is not None and task.lazy_archive_spec is not None:
+        return read_text_from_archive_member(task.lazy_archive_path, task.lazy_archive_spec)
+    raise ValueError(
+        f"Cannot load text for task {task.source_id}: missing lazy-load fields"
+    )
+
+
+def _match_command_blocks(blocks: List[CommandBlock], needle: str) -> List[CommandBlock]:
+    """Exact normalized command match first; otherwise all blocks whose command starts with needle."""
+    n = needle.lower().strip()
+    if not n:
+        return []
+    exact = [b for b in blocks if b.command == n]
+    if exact:
+        return exact
+    return [b for b in blocks if b.command.startswith(n)]
+
+
+def run_showtech_command_extract(
+    tasks: Sequence[ProcessingTask],
+    list_commands: bool,
+    raw_command: Optional[str],
+) -> Tuple[int, str]:
+    """
+    Build command list (-L) or raw section bodies (-r) for each task.
+    Returns (exit_code, text). exit_code is 1 if raw mode had no match in any input.
+    """
+    parser = TechSupportParser()
+    exit_code = 0
+    chunks: List[str] = []
+
+    for task in tasks:
+        text = load_task_text(task)
+        blocks = parser.parse(text)
+        del text
+        if task.text is not None:
+            task.text = None
+
+        chunks.append(f"# source: {task.source_id}")
+        if list_commands:
+            for b in blocks:
+                chunks.append(b.command)
+        else:
+            assert raw_command is not None
+            matched = _match_command_blocks(blocks, raw_command)
+            if not matched:
+                chunks.append("(no matching command section)")
+                exit_code = 1
+                print(
+                    f"warning: no section matching {raw_command!r} in {task.source_id}",
+                    file=sys.stderr,
+                )
+            else:
+                for i, blk in enumerate(matched, start=1):
+                    if len(matched) > 1:
+                        chunks.append(
+                            f"# --- match {i}/{len(matched)}: {blk.command} ---"
+                        )
+                    chunks.append("\n".join(blk.lines))
+        chunks.append("")
+
+    return exit_code, "\n".join(chunks).rstrip()
+
+
 def process_single_task(task: ProcessingTask) -> Tuple[str, str]:
     """
     Process a single file task and return (source_id, report).
@@ -4382,7 +4488,6 @@ def main(argv: Optional[Sequence[str]] = None) -> None:
 
     # Validate that paths are provided when not using --list-checks
     if not args.paths:
-        import sys
         print("error: the following arguments are required: PATH (unless using --list-checks)", file=sys.stderr)
         sys.exit(2)
 
@@ -4403,7 +4508,25 @@ def main(argv: Optional[Sequence[str]] = None) -> None:
     if not tasks:
         LOG.warning("No show-tech files found to process.")
         return
-    
+
+    if args.list_showtech_commands or args.raw_command is not None:
+        ec, extract_out = run_showtech_command_extract(
+            tasks,
+            list_commands=args.list_showtech_commands,
+            raw_command=args.raw_command,
+        )
+        if args.output:
+            out_path = Path(args.output)
+            try:
+                out_path.write_text(extract_out, encoding="utf-8")
+                LOG.info("Extract output written to: %s", out_path)
+            except OSError as exc:
+                LOG.error("Failed to write output to %s: %s", out_path, exc)
+                print(extract_out)
+        else:
+            print(extract_out)
+        sys.exit(ec)
+
     LOG.info("Found %d file(s) to process", len(tasks))
     if low_memory:
         LOG.info("Low-memory mode enabled: files will be loaded on-demand")
