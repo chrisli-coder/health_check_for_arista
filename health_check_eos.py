@@ -32,7 +32,7 @@ from typing import Dict, Iterable, List, Optional, Sequence, Tuple
 __author__ = "chris.li@arista.com"
 __company__ = "Arista Networks"
 __last_modified__ = "2026-03-20"
-__version__ = "1.2.5"
+__version__ = "1.2.6"
 
 
 LOG = logging.getLogger("health_check_eos")
