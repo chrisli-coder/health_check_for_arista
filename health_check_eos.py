@@ -3012,6 +3012,69 @@ class HardwareFpgaErrorCheck(BaseCheck):
         ]
 
 
+_SCD_SATELLITE_RETRY_ERR_RE = re.compile(
+    r"RetryErr\s*[=:]\s*(0x[0-9a-fA-F]+)", re.IGNORECASE
+)
+
+
+def _scd_satellite_nonzero_retry_details(raw_lines: Sequence[str]) -> List[str]:
+    """
+    For satellite debug: last section title, non-zero *RetryErr (not *RetryErrCnt*),
+    then remaining 0x register lines for the same SwitchLcN in that section.
+    """
+    out: List[str] = []
+    last_heading: Optional[str] = None
+    time_line_for_section: Optional[str] = None
+    for idx, ln in enumerate(raw_lines):
+        st = ln.strip()
+        if "register values:" in st.lower():
+            last_heading = st
+            time_line_for_section = None
+            continue
+        if (
+            last_heading is not None
+            and time_line_for_section is None
+            and st
+            and "collection time" in st.lower()
+        ):
+            time_line_for_section = st
+            continue
+        if "RetryErr" not in ln:
+            continue
+        m = _SCD_SATELLITE_RETRY_ERR_RE.search(ln)
+        if not m:
+            continue
+        try:
+            v = int(m.group(1), 16)
+        except ValueError:
+            continue
+        if v == 0:
+            continue
+        lc_m = re.search(r"SwitchLc(\d+)RetryErr\s*[=:]", ln, re.IGNORECASE)
+        lc = lc_m.group(1) if lc_m else None
+        if last_heading and (not out or out[-1] != last_heading):
+            out.append(last_heading)
+            if time_line_for_section:
+                out.append(time_line_for_section)
+        out.append(ln.rstrip("\r\n"))
+        if lc is None:
+            continue
+        needle = f"SwitchLc{lc}"
+        for j in range(idx + 1, len(raw_lines)):
+            nxt = raw_lines[j]
+            nst = nxt.strip()
+            if "register values:" in nst.lower():
+                break
+            if not nst.startswith("0x"):
+                continue
+            other = re.search(r"SwitchLc(\d+)", nst)
+            if other is not None and other.group(1) != lc:
+                break
+            if needle in nst:
+                out.append(nxt.rstrip("\r\n"))
+    return out
+
+
 @register_check
 class ScdSatelliteRetryErrCheck(BaseCheck):
     name = "scd_satellite_retry_error"
@@ -3030,20 +3093,15 @@ class ScdSatelliteRetryErrCheck(BaseCheck):
                 )
             ]
         lines = blocks[0].lines
-        offenders = []
-        for line in lines:
-            if "RetryErr" in line:
-                m = re.search(r"RetryErr\s*=\s*(0x[0-9a-fA-F]+)", line)
-                if m and m.group(1).lower() != "0x0":
-                    offenders.append(line.strip())
-        if offenders:
+        detail_lines = _scd_satellite_nonzero_retry_details(lines)
+        if detail_lines:
             return [
                 CheckResult(
                     name=self.name,
                     category=self.category,
                     severity=Severity.WARN,
-                    summary="RetryErr not 0x0 in satellite debug.",
-                    details=offenders,
+                    summary="Non-zero RetryErr in satellite debug.",
+                    details=detail_lines,
                 )
             ]
         return [
@@ -3051,7 +3109,7 @@ class ScdSatelliteRetryErrCheck(BaseCheck):
                 name=self.name,
                 category=self.category,
                 severity=Severity.OK,
-                summary="RetryErr is 0x0 for all entries in satellite debug.",
+                summary="RetryErr is zero for all matched satellite debug entries.",
             )
         ]
 
@@ -3618,6 +3676,10 @@ def format_human_report(
                     content.append("(No A or C type drops found)")
                 return content
 
+            if r.name == "scd_satellite_retry_error" and limit is not None:
+                fl = _scd_satellite_nonzero_retry_details(raw_lines)
+                return fl if fl else ["(No non-zero RetryErr lines)"]
+
             # Default: no filtering, use full raw output.
             return list(raw_lines)
 
@@ -4125,6 +4187,16 @@ def format_human_report(
                                 lines.append(line)
                         else:
                             lines.append("(No lines matched the patterns)")
+                        lines.append("-" * 80)
+                    elif r.name == "scd_satellite_retry_error":
+                        fl = _scd_satellite_nonzero_retry_details(raw_lines)
+                        lines.append(f"[DEBUG filtered {cmd}]")
+                        lines.append("-" * 80)
+                        if fl:
+                            for line in fl:
+                                lines.append(line)
+                        else:
+                            lines.append("(No non-zero RetryErr lines)")
                         lines.append("-" * 80)
                     else:
                         # Normal case: output full raw
