@@ -17,6 +17,7 @@ import argparse
 import concurrent.futures
 import datetime as _dt
 import gc
+import gzip
 import json
 import logging
 import os
@@ -400,26 +401,51 @@ class TechSupportContext:
 # ---------------------------------------------------------------------------
 
 
+def _path_under_tech_support_directory(member_or_path: str) -> bool:
+    """
+    True if the path has a directory component named 'tech-support' (EOS rotated log dir).
+
+    Those bundles are skipped; we only pick top-level / support-bundle style show-tech files.
+    """
+    norm = member_or_path.replace("\\", "/").strip()
+    parts = [p for p in norm.split("/") if p and p not in (".",)]
+    return any(p.lower() == "tech-support" for p in parts)
+
+
+def is_showtech_filename(basename: str) -> bool:
+    """
+    Return True if the last path segment looks like a show-tech / tech-support bundle file.
+
+    Matches EOS support-bundle names with or without a "show" prefix (e.g. tech_support_*,
+    *-tech-support-all-*) and excludes extended / ribd variants where applicable.
+    """
+    base = basename.lower()
+    if base in ("show-tech", "show-tech-support-all"):
+        return True
+    if "tech-support-all" in base:
+        if "tech-support-extended" in base or "tech-support-ribd" in base:
+            return False
+        return True
+    if base.startswith("show-tech") and not base.startswith(
+        "show-tech-support-extended"
+    ) and not base.startswith("show-tech-support-ribd"):
+        return True
+    if "tech_support" in base:
+        if "tech_support_extended" in base or "tech_support_ribd" in base:
+            return False
+        return True
+    return False
+
+
 def discover_showtech_files_from_directory(root: Path) -> List[Path]:
     """Recursively find show-tech/show-tech-support-all files under a directory."""
-    # Match exact filenames or files containing show-tech/show-tech-support-all
-    # Examples: "show-tech", "show-tech-support-all", 
-    #           "localhost-show-tech-support-all-2026_02_08-07_29_38.log", etc.
     results: List[Path] = []
     for path in root.rglob("*"):
         if not path.is_file():
             continue
-        name = path.name.lower()
-        # Exact match
-        if name in ("show-tech", "show-tech-support-all"):
-            results.append(path)
-        # Contains show-tech-support-all (for files like localhost-show-tech-support-all-*.log)
-        elif "show-tech-support-all" in name:
-            results.append(path)
-        # Starts with show-tech but not extended variants
-        elif (name.startswith("show-tech") and 
-              not name.startswith("show-tech-support-extended") and
-              not name.startswith("show-tech-support-ribd")):
+        if _path_under_tech_support_directory(str(path)):
+            continue
+        if is_showtech_filename(path.name):
             results.append(path)
     return results
 
@@ -441,15 +467,9 @@ def discover_showtech_members_from_archive(archive_path: Path) -> List[ArchiveSh
     members: List[ArchiveShowTechMember] = []
 
     def is_showtech(name_: str) -> bool:
-        base = Path(name_).name.lower()
-        # Accept exact match or files containing show-tech/show-tech-support-all
-        # Examples: "show-tech", "show-tech-support-all", 
-        #           "localhost-show-tech-support-all-2026_02_08-07_29_38.log",
-        #           "tmp/support-bundle-cmds/show-tech", etc.
-        return (base in ("show-tech", "show-tech-support-all") or
-                "show-tech-support-all" in base or
-                (base.startswith("show-tech") and not base.startswith("show-tech-support-extended") 
-                 and not base.startswith("show-tech-support-ribd")))
+        if _path_under_tech_support_directory(name_):
+            return False
+        return is_showtech_filename(Path(name_).name)
     def is_nested_archive(name_: str) -> bool:
         lower = name_.lower()
         return lower.endswith((".zip", ".tar", ".tar.gz", ".tgz"))
@@ -540,6 +560,22 @@ def discover_showtech_members_from_archive(archive_path: Path) -> List[ArchiveSh
     return members
 
 
+def _bytes_to_text_maybe_gunzip(member_name: str, data: bytes) -> str:
+    """Decode archive member bytes; gunzip single-file .gz members (not .tar.gz)."""
+    lower = member_name.lower()
+    if lower.endswith(".gz") and not lower.endswith(".tar.gz"):
+        try:
+            data = gzip.decompress(data)
+        except Exception:
+            pass
+    return data.decode("utf-8", errors="replace")
+
+
+def _read_path_maybe_gunzip(path: Path) -> str:
+    """Read a file from disk; gunzip single-file .gz (not .tar.gz), same rules as bundles."""
+    return _bytes_to_text_maybe_gunzip(path.name, path.read_bytes())
+
+
 def read_text_from_archive_member(archive_path: Path, spec: ArchiveShowTechMember) -> str:
     """
     Read text for a show-tech file represented by ArchiveShowTechMember
@@ -550,7 +586,7 @@ def read_text_from_archive_member(archive_path: Path, spec: ArchiveShowTechMembe
         if zipfile.is_zipfile(archive_path):
             with zipfile.ZipFile(archive_path, "r") as zf:
                 with zf.open(spec.inner_member, "r") as f:
-                    return f.read().decode("utf-8", errors="replace")
+                    return _bytes_to_text_maybe_gunzip(spec.inner_member, f.read())
         else:
             with tarfile.open(archive_path, "r:*") as tf:
                 member = tf.getmember(spec.inner_member)
@@ -558,7 +594,7 @@ def read_text_from_archive_member(archive_path: Path, spec: ArchiveShowTechMembe
                 if f is None:
                     return ""
                 data = f.read()
-                return data.decode("utf-8", errors="replace")
+                return _bytes_to_text_maybe_gunzip(spec.inner_member, data)
 
     # Nested archive case
     outer_name = spec.outer_member
@@ -576,7 +612,7 @@ def read_text_from_archive_member(archive_path: Path, spec: ArchiveShowTechMembe
                 bio.seek(0)
                 with zipfile.ZipFile(bio, "r") as nz:
                     with nz.open(spec.inner_member, "r") as f:
-                        return f.read().decode("utf-8", errors="replace")
+                        return _bytes_to_text_maybe_gunzip(spec.inner_member, f.read())
             else:
                 bio.seek(0)
                 try:
@@ -586,7 +622,7 @@ def read_text_from_archive_member(archive_path: Path, spec: ArchiveShowTechMembe
                         if f is None:
                             return ""
                         data = f.read()
-                        return data.decode("utf-8", errors="replace")
+                        return _bytes_to_text_maybe_gunzip(spec.inner_member, data)
                 except tarfile.TarError:
                     return ""
     else:
@@ -603,7 +639,7 @@ def read_text_from_archive_member(archive_path: Path, spec: ArchiveShowTechMembe
                 bio.seek(0)
                 with zipfile.ZipFile(bio, "r") as nz:
                     with nz.open(spec.inner_member, "r") as f:
-                        return f.read().decode("utf-8", errors="replace")
+                        return _bytes_to_text_maybe_gunzip(spec.inner_member, f.read())
             else:
                 bio.seek(0)
                 try:
@@ -613,7 +649,7 @@ def read_text_from_archive_member(archive_path: Path, spec: ArchiveShowTechMembe
                         if f is None:
                             return ""
                         data = f.read()
-                        return data.decode("utf-8", errors="replace")
+                        return _bytes_to_text_maybe_gunzip(spec.inner_member, data)
                 except tarfile.TarError:
                     return ""
 
@@ -4271,7 +4307,7 @@ def load_task_text(task: ProcessingTask) -> str:
     if task.text is not None:
         return task.text
     if task.lazy_path is not None:
-        return task.lazy_path.read_text(encoding="utf-8", errors="replace")
+        return _read_path_maybe_gunzip(task.lazy_path)
     if task.lazy_archive_path is not None and task.lazy_archive_spec is not None:
         return read_text_from_archive_member(task.lazy_archive_path, task.lazy_archive_spec)
     raise ValueError(
@@ -4348,7 +4384,7 @@ def process_single_task(task: ProcessingTask) -> Tuple[str, str]:
         if text is None:
             if task.lazy_path is not None:
                 # Load from plain file
-                text = task.lazy_path.read_text(encoding="utf-8", errors="replace")
+                text = _read_path_maybe_gunzip(task.lazy_path)
             elif task.lazy_archive_path is not None and task.lazy_archive_spec is not None:
                 # Load from archive member
                 text = read_text_from_archive_member(task.lazy_archive_path, task.lazy_archive_spec)
@@ -4424,7 +4460,7 @@ def collect_processing_tasks(
                 else:
                     # Pre-load mode: load now
                     try:
-                        text = f.read_text(encoding="utf-8", errors="replace")
+                        text = _read_path_maybe_gunzip(f)
                         tasks.append(ProcessingTask(
                             source_id=str(f),
                             text=text,
@@ -4502,7 +4538,7 @@ def collect_processing_tasks(
                 else:
                     # Pre-load mode: load now
                     try:
-                        text = path.read_text(encoding="utf-8", errors="replace")
+                        text = _read_path_maybe_gunzip(path)
                         tasks.append(ProcessingTask(
                             source_id=str(path),
                             text=text,
