@@ -4,7 +4,7 @@ Arista EOS support-bundle / show-tech health check tool.
 
 Author : chris.li@arista.com
 Company: Arista Networks
-Date   : 2026-01-29
+Date   : 2026-03-23
 
 This script analyses EOS show-tech / show-tech-support-all outputs
 and related support-bundle archives/directories and generates a
@@ -32,8 +32,8 @@ from typing import Dict, Iterable, List, Optional, Sequence, Tuple
 
 __author__ = "chris.li@arista.com"
 __company__ = "Arista Networks"
-__last_modified__ = "2026-03-20"
-__version__ = "1.2.6"
+__last_modified__ = "2026-03-23"
+__version__ = "1.2.7"
 
 
 LOG = logging.getLogger("health_check_eos")

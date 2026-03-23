@@ -4,7 +4,8 @@ A comprehensive health check tool for analyzing Arista EOS device show-tech file
 
 **Author**: chris.li@arista.com  
 **Company**: Arista Networks  
-**Last Modified**: 2026-03-20
+**Version**: 1.2.7  
+**Last Modified**: 2026-03-23
 
 ## Description
 
