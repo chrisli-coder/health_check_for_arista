@@ -3156,6 +3156,7 @@ class ScdSatelliteRetryErrCheck(BaseCheck):
 RUNNING_CONFIG_PATTERNS_BY_PLATFORM = {
     "78xx": [
         "ip hardware fib next-hop arp dedicated",
+        "platform sand lag hardware-only",
         # Add more patterns for 78xx here as needed
         # Example: "another pattern to check for 78xx",
     ],
