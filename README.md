@@ -4,8 +4,8 @@ A comprehensive health check tool for analyzing Arista EOS device show-tech file
 
 **Author**: chris.li@arista.com  
 **Company**: Arista Networks  
-**Version**: 1.2.7  
-**Last Modified**: 2026-03-23
+**Version**: 1.2.8  
+**Last Modified**: 2026-03-27
 
 ## Description
 
@@ -43,7 +43,7 @@ This tool analyzes Arista EOS show-tech / show-tech-support-all outputs and rela
   - Hardware status (modules, PCI errors, FPGA errors)
   - Interface statistics (errors, discards, queue drops)
   - Storage health (flash usage, storage status)
-  - Platform-specific checks (FAP fabric SerDes links, redundancy status)
+  - Platform-specific checks (FAP fabric SerDes, FAP counters `| nz`, redundancy status)
   - Configuration checks (running-config patterns)
 
 ## Requirements
@@ -232,6 +232,7 @@ The tool performs various health checks organized by category:
 - `show module`: Module uptime status
 - `show platform sand health`: Linecard and fabric card initialization status
 - `show platform fap fabric detail`: SerDes link status (78xx, 75xx)
+- `show platform fap counters | nz`: Non-zero FAP counters — **75xx**: *Cgm Unicast Data Buffer Drop Reassembly Cnt* warns if *Last update* is the same calendar day as `show clock`; **78xx**: *Voq Latency Rjct* warns if the counter row appears. Report details repeat the original chip title, separator, column header, and `[Block]` lines so data stays column-aligned with the table.
 - `show redundancy status`: Redundancy protocol status (78xx, 75xx)
 - `show pci`: PCI errors (FatalErr, SMBusERR)
 - `show hardware counter drop`: Hardware drop counters

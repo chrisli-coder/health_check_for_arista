@@ -4,7 +4,7 @@ Arista EOS support-bundle / show-tech health check tool.
 
 Author : chris.li@arista.com
 Company: Arista Networks
-Date   : 2026-03-23
+Date   : 2026-03-27
 
 This script analyses EOS show-tech / show-tech-support-all outputs
 and related support-bundle archives/directories and generates a
@@ -32,8 +32,8 @@ from typing import Dict, Iterable, List, Optional, Sequence, Tuple
 
 __author__ = "chris.li@arista.com"
 __company__ = "Arista Networks"
-__last_modified__ = "2026-03-23"
-__version__ = "1.2.7"
+__last_modified__ = "2026-03-27"
+__version__ = "1.2.8"
 
 
 LOG = logging.getLogger("health_check_eos")
@@ -1577,6 +1577,289 @@ class FapFabricSerdesCheck(BaseCheck):
 
 
 @register_check
+class PlatformFapCountersNzCheck(BaseCheck):
+    name = "platform_fap_counters_nz"
+    category = "hardware"
+    supported_platforms = ("78xx", "75xx")
+
+    CMD_PREFIX = "show platform fap counters"
+    CNTR_75_RE = re.compile(
+        r"Cgm\s+Unicast\s+Data\s+Buffer\s+Drop\s+Reassembly\s+Cnt",
+        re.IGNORECASE,
+    )
+    CNTR_78_RE = re.compile(r"Voq\s+Latency\s+Rjct", re.IGNORECASE)
+    DATE_RE = re.compile(r"(\d{4}-\d{2}-\d{2}\s+\d{2}:\d{2}:\d{2})")
+    _CHIP_SECTION_RE = re.compile(r"^(\S+/\d+)\s+Counters\b")
+    _CGM_BRACKET_RE = re.compile(r"^(\[[^\]]+\])\s*$")
+
+    @staticmethod
+    def _is_separator_dash_line(raw: str) -> bool:
+        t = raw.strip()
+        return len(t) >= 3 and set(t) == {"-"}
+
+    @classmethod
+    def _is_counter_table_header_line(cls, stripped: str) -> bool:
+        lower = stripped.lower()
+        if "counter name" in lower and "value" in lower:
+            return True
+        return "value" in lower and "last update" in lower
+
+    @classmethod
+    def _context_prefix_line_indices(cls, lines: Sequence[str], i: int) -> List[int]:
+        """
+        Lines above a counter row that recreate the CLI layout: chip title, rule line,
+        column header, [BlockName] — all verbatim so the following counter line stays
+        column-aligned with the header.
+        """
+        n = len(lines)
+        if i < 0 or i >= n:
+            return []
+        block_idx: Optional[int] = None
+        j = i - 1
+        while j >= 0:
+            if cls._CGM_BRACKET_RE.match(lines[j].strip()):
+                block_idx = j
+                break
+            j -= 1
+
+        header_idx: Optional[int] = None
+        start_scan = block_idx - 1 if block_idx is not None else i - 1
+        j = start_scan
+        while j >= 0:
+            st = lines[j].strip()
+            if cls._is_counter_table_header_line(st):
+                header_idx = j
+                break
+            if block_idx is not None and cls._CHIP_SECTION_RE.match(st):
+                break
+            j -= 1
+
+        dash_idx: Optional[int] = None
+        chip_idx: Optional[int] = None
+        if header_idx is not None:
+            j = header_idx - 1
+            while j >= 0:
+                st = lines[j].strip()
+                if cls._is_separator_dash_line(lines[j]):
+                    dash_idx = j
+                    break
+                if cls._CHIP_SECTION_RE.match(st):
+                    chip_idx = j
+                    break
+                j -= 1
+        if chip_idx is None and dash_idx is not None:
+            j = dash_idx - 1
+            while j >= 0:
+                if cls._CHIP_SECTION_RE.match(lines[j].strip()):
+                    chip_idx = j
+                    break
+                j -= 1
+
+        idxs = [x for x in (chip_idx, dash_idx, header_idx, block_idx) if x is not None]
+        idxs.sort()
+        return idxs
+
+    @classmethod
+    def _enriched_counter_rows(
+        cls, lines: Sequence[str], row_indices: Sequence[int]
+    ) -> List[str]:
+        """
+        Repeat chip section headings as in the CLI (chip line, rule, column header, block),
+        then the counter line unchanged (preserves leading spaces vs. table columns).
+        """
+        out: List[str] = []
+        last_prefix_key: Optional[Tuple[int, ...]] = None
+        for i in row_indices:
+            if i < 0 or i >= len(lines):
+                continue
+            prefix = tuple(cls._context_prefix_line_indices(lines, i))
+            if prefix != last_prefix_key:
+                for j in prefix:
+                    if 0 <= j < len(lines):
+                        out.append(lines[j].rstrip("\r\n"))
+                last_prefix_key = prefix
+            out.append(lines[i].rstrip("\r\n"))
+        return out
+
+    @classmethod
+    def _last_update_ts_75xx_line(cls, line: str) -> Optional[str]:
+        """
+        Column order in 'show platform fap counters': Value, First update, Last update,
+        optional Last discontinuity. When First is blank there is only one timestamp (Last update).
+        Use index 1 when two or more timestamps exist so we never pick Last discontinuity.
+        """
+        dates = cls.DATE_RE.findall(line)
+        if not dates:
+            return None
+        if len(dates) == 1:
+            return dates[0]
+        return dates[1]
+
+    def run(self, ctx: TechSupportContext) -> List[CheckResult]:
+        blocks = ctx.get_blocks(self.CMD_PREFIX)
+        LOG.debug(
+            "platform_fap_counters_nz check: found %d block(s) for %r",
+            len(blocks),
+            self.CMD_PREFIX,
+        )
+        if not blocks:
+            return [
+                CheckResult(
+                    name=self.name,
+                    category=self.category,
+                    severity=Severity.INFO,
+                    summary="show platform fap counters | nz output not found.",
+                    command=self.CMD_PREFIX,
+                )
+            ]
+        lines = blocks[0].lines
+
+        if ctx.platform_series == "75xx":
+            matched_idx = [
+                (i, ln)
+                for i, ln in enumerate(lines)
+                if self.CNTR_75_RE.search(ln)
+            ]
+            if not matched_idx:
+                return [
+                    CheckResult(
+                        name=self.name,
+                        category=self.category,
+                        severity=Severity.OK,
+                        summary=(
+                            "Cgm Unicast Data Buffer Drop Reassembly Cnt not present in "
+                            "non-zero FAP counters."
+                        ),
+                        command=self.CMD_PREFIX,
+                    )
+                ]
+            sample_idx = [i for i, _ in matched_idx[:10]]
+            if not ctx.system_time:
+                return [
+                    CheckResult(
+                        name=self.name,
+                        category=self.category,
+                        severity=Severity.INFO,
+                        summary=(
+                            "Cgm Unicast Data Buffer Drop Reassembly Cnt row present but "
+                            "system time unavailable; cannot compare last update date."
+                        ),
+                        details=self._enriched_counter_rows(lines, sample_idx),
+                        command=self.CMD_PREFIX,
+                    )
+                ]
+            try:
+                dt_clock = _dt.datetime.strptime(
+                    ctx.system_time.strip(), "%a %b %d %H:%M:%S %Y"
+                )
+                date_clock = dt_clock.date()
+            except (ValueError, TypeError) as exc:
+                LOG.debug("platform_fap_counters_nz: show clock parse failed: %s", exc)
+                return [
+                    CheckResult(
+                        name=self.name,
+                        category=self.category,
+                        severity=Severity.INFO,
+                        summary=(
+                            "Cgm Unicast Data Buffer Drop Reassembly Cnt row present but "
+                            "show clock could not be parsed; cannot compare last update date."
+                        ),
+                        details=self._enriched_counter_rows(lines, sample_idx),
+                        command=self.CMD_PREFIX,
+                    )
+                ]
+
+            same_day = False
+            warn_indices: List[int] = []
+            for i, ln in matched_idx:
+                last_ts = self._last_update_ts_75xx_line(ln)
+                if not last_ts:
+                    continue
+                try:
+                    dt_last = _dt.datetime.strptime(
+                        last_ts, "%Y-%m-%d %H:%M:%S"
+                    )
+                except (ValueError, TypeError):
+                    continue
+                if dt_last.date() == date_clock:
+                    same_day = True
+                    if i not in warn_indices:
+                        warn_indices.append(i)
+                    if len(warn_indices) >= 10:
+                        break
+
+            if same_day:
+                return [
+                    CheckResult(
+                        name=self.name,
+                        category=self.category,
+                        severity=Severity.WARN,
+                        summary=(
+                            "Last update date for Cgm Unicast Data Buffer Drop Reassembly Cnt "
+                            "matches device date (show clock)."
+                        ),
+                        details=self._enriched_counter_rows(lines, warn_indices),
+                        command=self.CMD_PREFIX,
+                    )
+                ]
+            if not any(self._last_update_ts_75xx_line(ln) for _, ln in matched_idx):
+                return [
+                    CheckResult(
+                        name=self.name,
+                        category=self.category,
+                        severity=Severity.INFO,
+                        summary=(
+                            "Cgm Unicast Data Buffer Drop Reassembly Cnt row present but "
+                            "no YYYY-MM-DD timestamp found on row."
+                        ),
+                        details=self._enriched_counter_rows(lines, sample_idx),
+                        command=self.CMD_PREFIX,
+                    )
+                ]
+            return [
+                CheckResult(
+                    name=self.name,
+                    category=self.category,
+                    severity=Severity.OK,
+                    summary=(
+                        "Cgm Unicast Data Buffer Drop Reassembly Cnt present; last update is "
+                        "not the same calendar day as show clock."
+                    ),
+                    details=self._enriched_counter_rows(lines, sample_idx),
+                    command=self.CMD_PREFIX,
+                )
+            ]
+
+        # 78xx
+        matched78_idx = [
+            (i, ln)
+            for i, ln in enumerate(lines)
+            if self.CNTR_78_RE.search(ln)
+        ]
+        if matched78_idx:
+            idx78 = [i for i, _ in matched78_idx[:10]]
+            return [
+                CheckResult(
+                    name=self.name,
+                    category=self.category,
+                    severity=Severity.WARN,
+                    summary="Voq Latency Rjct present in non-zero FAP counters.",
+                    details=self._enriched_counter_rows(lines, idx78),
+                    command=self.CMD_PREFIX,
+                )
+            ]
+        return [
+            CheckResult(
+                name=self.name,
+                category=self.category,
+                severity=Severity.OK,
+                summary="Voq Latency Rjct not present in non-zero FAP counters.",
+                command=self.CMD_PREFIX,
+            )
+        ]
+
+
+@register_check
 class RedundancyStatusCheck(BaseCheck):
     name = "redundancy_status"
     category = "system"
@@ -1894,6 +2177,8 @@ LOGGING_THRESHOLD_ERROR_PATTERNS = [
     r"(?<!:)\bECC\b",
     r"\bCRC\b",
     r"\bDRAM_FATAL_INTERRUPT\b",
+    # AttrLog buffer exhaustion
+    r"AttrLog buffer is full",
 ]
 
 
@@ -3480,6 +3765,7 @@ def _infer_command_from_check(check: CheckResult) -> Optional[str]:
         "module_uptime": "show module",
         "platform_sand_health": "show platform sand health",
         "fap_fabric_serdes": "show platform fap fabric detail",
+        "platform_fap_counters_nz": "show platform fap counters | nz",
         "redundancy_status": "show redundancy status",
         "pci_errors": "show pci",
         "agent_logs_crash": "show agent logs crash",
@@ -3562,6 +3848,21 @@ def format_human_report(
                 return [ln for ln in raw_lines if re.search(pattern, ln)] or [
                     "(No lines matched the pattern)"
                 ]
+
+            if r.name == "platform_fap_counters_nz":
+                if ctx.platform_series == "75xx":
+                    pat = PlatformFapCountersNzCheck.CNTR_75_RE
+                    idxs = [i for i, ln in enumerate(raw_lines) if pat.search(ln)]
+                else:
+                    idxs = [
+                        i
+                        for i, ln in enumerate(raw_lines)
+                        if PlatformFapCountersNzCheck.CNTR_78_RE.search(ln)
+                    ]
+                enriched = PlatformFapCountersNzCheck._enriched_counter_rows(
+                    raw_lines, idxs
+                )
+                return enriched or ["(No lines matched the pattern)"]
 
             if r.name == "logging_threshold_errors":
                 patterns = LOGGING_THRESHOLD_ERROR_PATTERNS
@@ -3871,7 +4172,28 @@ def format_human_report(
                 if blocks:
                     raw_lines = blocks[0].lines
                     lines.append("")
-                    if r.name == "fap_fabric_serdes":
+                    if r.name == "platform_fap_counters_nz":
+                        if ctx.platform_series == "75xx":
+                            pat = PlatformFapCountersNzCheck.CNTR_75_RE
+                            idxs = [i for i, ln in enumerate(raw_lines) if pat.search(ln)]
+                        else:
+                            idxs = [
+                                i
+                                for i, ln in enumerate(raw_lines)
+                                if PlatformFapCountersNzCheck.CNTR_78_RE.search(ln)
+                            ]
+                        matching_lines = PlatformFapCountersNzCheck._enriched_counter_rows(
+                            raw_lines, idxs
+                        )
+                        lines.append(f"[DEBUG filtered {cmd}]")
+                        lines.append("-" * 80)
+                        if matching_lines:
+                            for line in matching_lines:
+                                lines.append(line)
+                        else:
+                            lines.append("(No lines matched the pattern)")
+                        lines.append("-" * 80)
+                    elif r.name == "fap_fabric_serdes":
                         # Special case: output only lines matching the regex pattern
                         text = "\n".join(raw_lines)
                         if ctx.platform_series == "78xx":
