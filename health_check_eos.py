@@ -4,7 +4,7 @@ Arista EOS support-bundle / show-tech health check tool.
 
 Author : chris.li@arista.com
 Company: Arista Networks
-Date   : 2026-03-27
+Date   : 2026-03-30
 
 This script analyses EOS show-tech / show-tech-support-all outputs
 and related support-bundle archives/directories and generates a
@@ -21,6 +21,8 @@ import gzip
 import json
 import logging
 import os
+import shlex
+import subprocess
 from pathlib import Path
 import re
 import sys
@@ -32,8 +34,8 @@ from typing import Dict, Iterable, List, Optional, Sequence, Tuple
 
 __author__ = "chris.li@arista.com"
 __company__ = "Arista Networks"
-__last_modified__ = "2026-03-27"
-__version__ = "1.2.8"
+__last_modified__ = "2026-03-30"
+__version__ = "1.3.0"
 
 
 LOG = logging.getLogger("health_check_eos")
@@ -68,6 +70,7 @@ def build_arg_parser() -> argparse.ArgumentParser:
             "  %(prog)s -t 1 /path/to/show-tech              # Disable parallel processing\n"
             "  %(prog)s -L /path/to/show-tech                # List command sections in show-tech\n"
             "  %(prog)s -r \"show version\" /path/to/show-tech # Dump raw output of one section\n"
+            "  %(prog)s --cli /path/to/show-tech             # Interactive CLI over show-tech sections\n"
             "\n"
             "Author  : %(author)s\n"
             "Company : %(company)s\n"
@@ -83,7 +86,7 @@ def build_arg_parser() -> argparse.ArgumentParser:
             "One or more inputs: show-tech/show-tech-support-all file, "
             "unpacked support-bundle directory, or support-bundle archive "
             "(tar/tar.gz/tgz/zip). Type is detected automatically. "
-            "Not required only when using --list-checks (-L / -r require PATH)."
+            "Not required only when using --list-checks (-L / -r / --cli require PATH)."
         ),
     )
 
@@ -160,6 +163,17 @@ def build_arg_parser() -> argparse.ArgumentParser:
             "Dump the raw body of COMMAND from the show-tech input(s) and exit. "
             "Matching is case-insensitive: exact command first, else prefix. "
             "Quote multi-word commands. Requires PATH. Does not run health checks."
+        ),
+    )
+    showtech_extract.add_argument(
+        "--cli",
+        action="store_true",
+        help=(
+            "Interactive CLI over the first show-tech found under PATH: EOS-style abbreviated "
+            "commands, '?' for next-level keywords, paged output, '| grep' / '| include', "
+            "command history with arrow Up/Down on POSIX TTY; ASCII '?' ends input. "
+            "Prompt uses hostname from config (running-config) when available. "
+            "Does not run health checks."
         ),
     )
     debug_group.add_argument(
@@ -4695,6 +4709,824 @@ def run_showtech_command_extract(
     return exit_code, "\n".join(chunks).rstrip()
 
 
+# ---------------------------------------------------------------------------
+# Interactive show-tech CLI (--cli)
+# ---------------------------------------------------------------------------
+
+_SHOWTECH_CLI_PIPE_RE = re.compile(r"\s*\|\s*(grep|include)\s+(.+)$", re.IGNORECASE)
+
+@dataclass
+class _ShowTechTrieNode:
+    children: Dict[str, "_ShowTechTrieNode"] = field(default_factory=dict)
+    blocks_here: List["CommandBlock"] = field(default_factory=list)
+
+
+class _ShowTechCommandTrie:
+    """Word-level trie over section commands for EOS-style abbreviation and '?' help."""
+
+    def __init__(self, blocks: Sequence["CommandBlock"]) -> None:
+        self._all_blocks = list(blocks)
+        self._root = _ShowTechTrieNode()
+        self._insert_all()
+
+    def _insert_all(self) -> None:
+        for blk in self._all_blocks:
+            tokens = blk.command.split()
+            if not tokens:
+                continue
+            node = self._root
+            for t in tokens:
+                if t not in node.children:
+                    node.children[t] = _ShowTechTrieNode()
+                node = node.children[t]
+            node.blocks_here.append(blk)
+
+    @staticmethod
+    def _match_unique_child(node: _ShowTechTrieNode, user_tok: str) -> Tuple[Optional[str], List[str]]:
+        """Return (canonical_key, []) if unique; (None, []) if none; (None, candidates) if ambiguous."""
+        u = user_tok.lower()
+        # Exact child keyword (case-insensitive) wins over prefix match, so ``ip`` is not
+        # treated as an abbreviation of ``ipv6`` when both exist under ``show``.
+        exact = [k for k in node.children if k.lower() == u]
+        if len(exact) == 1:
+            return exact[0], []
+        cand = [k for k in node.children if k.lower().startswith(u)]
+        if len(cand) == 1:
+            return cand[0], []
+        if len(cand) == 0:
+            return None, []
+        return None, sorted(cand)
+
+    def _walk_prefix(self, prefix_tokens: List[str]) -> Tuple[Optional[_ShowTechTrieNode], Optional[str]]:
+        """
+        Walk trie using abbreviation resolution for each user token.
+        Returns (node, error_message). node is set on success.
+        """
+        node = self._root
+        for i, ut in enumerate(prefix_tokens):
+            if not ut:
+                return None, "Empty token in command."
+            key, amb = self._match_unique_child(node, ut)
+            if amb:
+                ctx = " ".join(prefix_tokens[:i] + [ut])
+                lines = "\n".join(f"  {c}" for c in amb)
+                return None, f"Ambiguous token {ut!r} after {ctx!r}:\n{lines}"
+            if key is None:
+                ctx = " ".join(prefix_tokens[: i + 1])
+                nxt = sorted(node.children.keys())
+                hint = "\n".join(f"  {c}" for c in nxt) if nxt else "  (no subcommands)"
+                return None, f"Unknown token {ut!r} in {ctx!r}. Next level options:\n{hint}"
+            node = node.children[key]
+        return node, None
+
+    def help_candidates(self, prefix_tokens: List[str], partial: str) -> Tuple[Optional[List[str]], Optional[str]]:
+        """List next-level command keywords (full spelling) after optional prefix filter."""
+        node, err = self._walk_prefix(prefix_tokens)
+        if err:
+            return None, err
+        assert node is not None
+        p = partial.lower()
+        keys = sorted(
+            k for k in node.children if not p or k.lower().startswith(p)
+        )
+        return keys, None
+
+    def resolve_blocks(self, tokens: List[str]) -> Tuple[Optional[List["CommandBlock"]], Optional[str]]:
+        if not tokens:
+            return None, "Empty command."
+        node, err = self._walk_prefix(tokens)
+        if err:
+            return None, err
+        assert node is not None
+        # Strict tree semantics per requirements:
+        # If a command node has both (1) a runnable section here (blocks_here) and
+        # (2) multiple child keywords, we must NOT execute the parent command.
+        # The user must refine the command further (or use '?').
+        if node.blocks_here:
+            if len(node.children) > 1:
+                nxt = sorted(node.children.keys())
+                hint = "\n".join(f"  {c}" for c in nxt)
+                return None, (
+                    "Incomplete command; type '?' to list next keywords:\n" + hint
+                )
+            return node.blocks_here, None
+        nxt = sorted(node.children.keys())
+        hint = "\n".join(f"  {c}" for c in nxt)
+        return None, f"Incomplete command; type '?' to list next keywords:\n{hint}"
+
+    def expand_cli_line(self, line: str) -> str:
+        """
+        EOS-style: expand each token to the canonical child keyword when the abbreviation
+        is unique; on ambiguous or unknown token, leave that token and the rest unchanged.
+        """
+        line = line.strip()
+        if not line:
+            return ""
+        parts = line.split()
+        node = self._root
+        out: List[str] = []
+        i = 0
+        while i < len(parts):
+            tok = parts[i]
+            key, amb = self._match_unique_child(node, tok)
+            if amb or key is None:
+                out.append(tok)
+                out.extend(parts[i + 1 :])
+                break
+            out.append(key)
+            node = node.children[key]
+            i += 1
+        return " ".join(out)
+
+
+def _cli_expand_full_input_line(trie: Optional[_ShowTechCommandTrie], s: str) -> str:
+    """Expand abbreviations for the command part only (before '|'); preserve '?' suffix and pipe tail."""
+    if not trie:
+        return s.strip()
+    s = s.rstrip("\r\n")
+    idx = s.find("|")
+    if idx >= 0:
+        left = s[:idx].rstrip()
+        right = s[idx:]
+    else:
+        left = s
+        right = ""
+
+    q = ""
+    if left.endswith("?"):
+        # Preserve whether user typed a space before '?'.
+        # "show ip ?" should be parsed as last token "?" (partial == ''),
+        # but "show ip?" should be parsed as last token ending with '?' (partial == 'ip').
+        had_space_before_q = len(left) >= 2 and left[-2].isspace()
+        q = " ?" if had_space_before_q else "?"
+        left = left[:-1].rstrip()
+
+    expanded_left = trie.expand_cli_line(left) if left.strip() else left.rstrip()
+
+    merged = expanded_left + q
+    return _cli_join_cmd_pipe(merged, right).strip()
+
+
+def _cli_join_cmd_pipe(left: str, right: str) -> str:
+    """Join expanded command prefix with '| grep' / '| include' tail, spacing like EOS."""
+    merged = left.rstrip()
+    if right:
+        if (
+            merged
+            and right.lstrip().startswith("|")
+            and not merged.endswith(" ")
+            and not right.startswith(" ")
+        ):
+            merged += " "
+        merged += right
+    return merged
+
+
+def _cli_tab_complete_line(trie: _ShowTechCommandTrie, core: str) -> str:
+    """
+    Tab: first apply unique abbrev expansion; if unchanged, complete the last token or
+    print candidate list (root, next-level keywords, or subcommands when last token is exact).
+    """
+    exp = _cli_expand_full_input_line(trie, core)
+    if exp != core:
+        idx0 = core.find("|")
+        right0 = core[idx0:] if idx0 >= 0 else ""
+        if not right0.strip():
+            e = exp.rstrip()
+            ret = (e + " ") if e else exp
+        else:
+            ret = exp.strip()
+        return ret
+
+    idx = core.find("|")
+    if idx >= 0:
+        left = core[:idx].rstrip()
+        right = core[idx:]
+    else:
+        left = core.rstrip()
+        right = ""
+
+    parts = left.split()
+
+    def merge(new_left: str, *, space_after: bool = False) -> str:
+        merged = _cli_join_cmd_pipe(new_left.rstrip(), right)
+        if space_after and (not right or not right.strip()):
+            s = merged.rstrip()
+            return (s + " ") if s else s
+        return merged.strip()
+
+    if not parts:
+        keys, err = trie.help_candidates([], "")
+        if err:
+            print(f"\n{err}", flush=True)
+            return core
+        if not keys:
+            return core
+        if len(keys) == 1:
+            return merge(keys[0], space_after=True)
+        print("\n" + "\n".join(keys), flush=True)
+        return core
+
+    pref, last = parts[:-1], parts[-1]
+    keys, err = trie.help_candidates(pref, last)
+    if err:
+        print(f"\n{err}", flush=True)
+        return core
+
+    # Match execution semantics: a token that equals a full child keyword (e.g. ``ip``)
+    # is not ambiguous with longer siblings (``ipv6``). help_candidates keeps prefix
+    # filtering for ``?``/refine; Tab narrows here so ``show ip`` + Tab lists ``ip``'s subtree.
+    if len(keys) > 1 and last:
+        exact = [k for k in keys if k.lower() == last.lower()]
+        if len(exact) == 1:
+            keys = exact
+
+    if len(keys) == 1:
+        nk = keys[0]
+        if nk != last:
+            return merge(" ".join(pref + [nk]), space_after=True)
+        keys2, err2 = trie.help_candidates(parts, "")
+        if err2:
+            print(f"\n{err2}", flush=True)
+            return core
+        if keys2:
+            if len(keys2) == 1:
+                return merge(" ".join(parts + [keys2[0]]), space_after=True)
+            print("\n" + "\n".join(keys2), flush=True)
+            # If `last` is an exact keyword and we listed its children (multiple
+            # next-level options), keep a trailing space so the user can type
+            # the next keyword directly without pressing space manually.
+            return merge(" ".join(parts), space_after=True)
+        return core
+
+    if len(keys) > 1:
+        print("\n" + "\n".join(keys), flush=True)
+        return core
+
+    keys2, err2 = trie.help_candidates(parts, "")
+    if not err2 and keys2:
+        print("\n" + "\n".join(keys2), flush=True)
+    return core
+
+
+def _parse_showtech_cli_pipe(
+    line: str,
+) -> Tuple[str, Optional[str], Optional[str]]:
+    """Split `... | grep ...` / `| include ...` from the rest (case-insensitive).
+
+    Returns:
+      (cmd_part, pipe_pattern, pipe_kind) where pipe_kind is "grep" or "include".
+    """
+    m = _SHOWTECH_CLI_PIPE_RE.search(line)
+    if not m:
+        return line.strip(), None, None
+    cmd = line[: m.start()].strip()
+    kind = m.group(1).lower()
+    pat = m.group(2).strip()
+    return cmd, pat if pat else None, kind
+
+
+def _parse_showtech_cli_help(cmd_part: str) -> Optional[Tuple[List[str], str]]:
+    """
+    If cmd_part asks for help via ASCII '?', return (prefix_tokens, partial_filter) else None.
+    partial_filter is '' to list all next-level words at the node after prefix_tokens.
+    """
+    # Only treat explicit '?' as a help request. Empty input or normal commands
+    # (including a line that's only a pipe tail like "| grep ...") must NOT enter
+    # help mode implicitly.
+    if "?" not in cmd_part:
+        return None
+    parts = cmd_part.split()
+    if not parts:
+        return None
+    last = parts[-1]
+    if last == "?":
+        return parts[:-1], ""
+    if last.endswith("?"):
+        # e.g. "show inter?" -> walk ["show"], filter next level by "inter"
+        return parts[:-1], last[:-1]
+    return None
+
+
+def _cli_refine_help_prefix(
+    trie: _ShowTechCommandTrie,
+    prefix_tokens: List[str],
+    partial: str,
+) -> Tuple[List[str], str]:
+    """
+    For suffix ``... word?`` (no space before ``?``): same as ``... word ?`` when we can
+    resolve ``word`` into a single trie step.
+
+    - If ``word`` equals a full child keyword (case-insensitive) among prefix matches,
+      descend into that node and list *its* sub-keys (e.g. ``show ip?`` → under ``ip``,
+      not ``ip`` vs ``ipv6`` at ``show``).
+    - If exactly one child matches ``word`` as an abbreviation (unique prefix), descend.
+    - If several children match and ``word`` is not an exact keyword name, stay and list
+      those matches (e.g. ``show ip r?`` → ``rip`` / ``route``).
+
+    Applies at any depth (``sh ver?``, ``show ipv6 neigh?``, etc.).
+    """
+    if not partial:
+        return list(prefix_tokens), partial
+    keys_probe, err_probe = trie.help_candidates(prefix_tokens, partial)
+    if err_probe or not keys_probe:
+        return list(prefix_tokens), partial
+    # '?' help semantics:
+    # - Only descend when the typed partial uniquely resolves to exactly one keyword.
+    # - If multiple candidates match (e.g. "ip" matches both "ip" and "ipv6"), keep
+    #   the current level so we list all matching options for that partial.
+    if len(keys_probe) == 1:
+        ret = list(prefix_tokens) + [keys_probe[0]], ""
+        return ret
+    ret = list(prefix_tokens), partial
+    return ret
+
+
+def _cli_resume_line_after_help(raw: str) -> str:
+    """
+    Command typed before '?' (no trailing help marker), for pre-filling the next prompt.
+    Uses the section before '| grep' / '| include' only.
+    """
+    cmd_part, _, _ = _parse_showtech_cli_pipe(raw.strip())
+    if "?" not in cmd_part:
+        return ""
+    base = cmd_part.rsplit("?", 1)[0]
+    had_space = base.endswith(" ")
+    trimmed = base.rstrip()
+    return trimmed
+
+
+def _showtech_cli_apply_grep(
+    lines: List[str],
+    pattern: Optional[str],
+    pipe_kind: Optional[str],
+) -> List[str]:
+    if pattern is None:
+        return lines
+    kind = (pipe_kind or "grep").lower()
+
+    # If grep is available, delegate to it so we support real grep behavior
+    # (regex, flags like -E/-v/-w, etc.).
+    grep_cmd: List[str]
+    try:
+        args = shlex.split(pattern)
+        if kind == "include":
+            grep_cmd = ["grep", "-F", *args]
+        else:
+            grep_cmd = ["grep", *args]
+
+        input_bytes = ("\n".join(lines) + "\n").encode("utf-8", errors="replace")
+        proc = subprocess.run(
+            grep_cmd,
+            input=input_bytes,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            check=False,
+        )
+
+        # grep: 0 = matches, 1 = no matches, >1 = error
+        if proc.returncode == 0:
+            return proc.stdout.decode("utf-8", errors="replace").splitlines()
+        if proc.returncode == 1:
+            return []
+
+        # Error path: show grep stderr so the user can fix regex/flags.
+        err_txt = proc.stderr.decode("utf-8", errors="replace").strip()
+        if err_txt:
+            print(err_txt)
+        return []
+    except FileNotFoundError:
+        # Fallback when grep binary isn't available: approximate substring match.
+        # Real grep is case-sensitive by default and only case-insensitive with `-i`.
+        pl_raw = pattern.strip()
+        parts = pl_raw.split()
+        ignore_case = False
+        while parts and parts[0] in {"-i", "--ignore-case"}:
+            ignore_case = True
+            parts.pop(0)
+        if not parts:
+            return []
+        pl = " ".join(parts)
+        if ignore_case:
+            pl = pl.lower()
+            return [ln for ln in lines if pl in ln.lower()]
+        return [ln for ln in lines if pl in ln]
+    except Exception:
+        # Never break the CLI due to grep/filtering issues.
+        return []
+
+
+def _showtech_cli_paginate(lines: List[str]) -> None:
+    if not lines:
+        print("(no output)")
+        return
+    try:
+        h = max(os.get_terminal_size().lines - 2, 8)
+    except OSError:
+        h = 22
+    if not sys.stdin.isatty():
+        print("\n".join(lines))
+        return
+    i = 0
+    n = len(lines)
+    while i < n:
+        end = min(i + h, n)
+        print("\n".join(lines[i:end]))
+        i = end
+        # No pager hint on the final page (or when output fits one screen).
+        if end >= n:
+            break
+        print("[Space=next q=quit other=next] ", end="", flush=True)
+        ch = "\n"
+        if sys.platform == "win32":
+            ch = sys.stdin.read(1)
+        else:
+            try:
+                import termios
+                import tty
+
+                fd = sys.stdin.fileno()
+                old = termios.tcgetattr(fd)
+                try:
+                    tty.setcbreak(fd)
+                    ch = sys.stdin.read(1)
+                finally:
+                    termios.tcsetattr(fd, termios.TCSADRAIN, old)
+            except (ImportError, OSError, AttributeError):
+                ch = sys.stdin.read(1)
+        if ch in ("q", "Q"):
+            print("\r\033[2K--- pager quit ---")
+            break
+        print("\r\033[2K", end="", flush=True)
+
+
+def _format_showtech_cli_matches(matched: List["CommandBlock"]) -> List[str]:
+    out: List[str] = []
+    for i, blk in enumerate(matched, start=1):
+        if len(matched) > 1:
+            out.append(f"# --- match {i}/{len(matched)}: {blk.command} ---")
+        out.extend(blk.lines)
+    return out
+
+
+def _showtech_cli_posix_tty_line(
+    prompt: str,
+    hist: List[str],
+    initial: Optional[str] = None,
+    trie: Optional[_ShowTechCommandTrie] = None,
+) -> str:
+    """
+    Read one line on a POSIX TTY with local echo, Backspace, Up/Down history,
+    and immediate submit when ASCII '?' is typed (no extra Enter).
+
+    ``initial`` seeds the buffer (e.g. after '?' help so the command prefix is kept).
+    Space / Enter expand unique abbreviations to full keywords (EOS-style).
+    Tab also expands; if nothing extra to expand, completes the last token or lists candidates.
+    """
+    import select
+    import termios
+    import tty
+
+    fd = sys.stdin.fileno()
+    old = termios.tcgetattr(fd)
+    hi = len(hist)
+    buf: List[str] = list(initial) if initial else []
+
+    def redraw() -> None:
+        sys.stdout.write("\r\033[K" + prompt + "".join(buf))
+        sys.stdout.flush()
+
+    def finish(ok: str) -> str:
+        sys.stdout.write("\n")
+        sys.stdout.flush()
+        return ok.strip()
+
+    try:
+        tty.setcbreak(fd)
+        redraw()
+        while True:
+            ch = sys.stdin.read(1)
+            if ch == "":
+                raise EOFError
+            if ch in ("\n", "\r"):
+                line = "".join(buf)
+                exp = _cli_expand_full_input_line(trie, line) if trie else line.strip()
+                return finish(exp)
+            if ch in ("\x7f", "\x08"):
+                if buf:
+                    buf.pop()
+                    redraw()
+                continue
+            if ch == "\x04" and not buf:
+                raise EOFError
+            if ch == "\x03":
+                buf.clear()
+                sys.stdout.write("^C\n")
+                sys.stdout.flush()
+                return finish("")
+            if ch == "\x1b":
+                # Arrow keys and other escapes — read the full sequence in one go.
+                # If we return early after only ESC, '[' and 'A' leak into the line as literals
+                # (common with IDE terminals that delay bytes after ESC).
+                def hist_up() -> None:
+                    nonlocal hi, buf
+                    if not hist:
+                        return
+                    if hi == len(hist):
+                        hi = len(hist) - 1
+                    elif hi > 0:
+                        hi -= 1
+                    buf = list(hist[hi])
+                    redraw()
+
+                def hist_down() -> None:
+                    nonlocal hi, buf
+                    if not hist:
+                        return
+                    if hi < len(hist) - 1:
+                        hi += 1
+                        buf = list(hist[hi])
+                    elif hi == len(hist) - 1:
+                        hi = len(hist)
+                        buf = []
+                    redraw()
+
+                # Robust escape reader:
+                # 1) Wait up to ESC_TOTAL for the complete arrow sequence.
+                # 2) Interpret if it's an up/down arrow.
+                # 3) Drain for a short window to discard any leftover bytes (e.g. '['/'A'/'B')
+                #    that otherwise leak into printable token handling.
+                import time
+                parts: List[str] = [ch]
+                MAX_ESC_BYTES = 8
+                # Keep ESC handling fast. If we fail to assemble the full arrow
+                # sequence due to terminal timing, the printable-path fallback
+                # below will still trigger hist_up/hist_down.
+                ESC_TOTAL = 0.06
+                esc_deadline = time.monotonic() + ESC_TOTAL
+                while len(parts) < MAX_ESC_BYTES and time.monotonic() < esc_deadline:
+                    remaining = esc_deadline - time.monotonic()
+                    if remaining <= 0:
+                        break
+                    if not select.select([fd], [], [], min(0.01, remaining))[0]:
+                        continue
+                    c = sys.stdin.read(1)
+                    if not c:
+                        break
+                    parts.append(c)
+                    if len(parts) == 2 and c not in "[O":
+                        break
+                    if len(parts) >= 3:
+                        # For our purposes, arrow keys have fixed last byte A/B.
+                        if parts[1] == "O" and parts[2] in "AB":
+                            break
+                        if parts[1] == "[" and parts[2] in "AB":
+                            break
+
+                seq = "".join(parts)
+
+                # NOTE: We intentionally do not "wait-more" here. Any leaked
+                # '[' + 'A'/'B' fragments will be handled in the printable-path
+                # fallback so Up/Down still works and remains responsive.
+
+                action: Optional[str] = None
+                if seq.startswith("\x1bO") and len(seq) >= 3:
+                    if seq[2] == "A":
+                        hist_up()
+                        action = "up"
+                    elif seq[2] == "B":
+                        hist_down()
+                        action = "down"
+                elif seq.startswith("\x1b[") and len(seq) >= 3:
+                    if seq[2] == "A":
+                        hist_up()
+                        action = "up"
+                    elif seq[2] == "B":
+                        hist_down()
+                        action = "down"
+
+                if len(seq) == 1:
+                    continue
+                continue
+            if ch == " ":
+                core = "".join(buf).rstrip()
+                exp = _cli_expand_full_input_line(trie, core) if trie else core
+                buf = list(exp + " ")
+                redraw()
+                continue
+            if ch == "\t":
+                if not trie:
+                    continue
+                before = "".join(buf)
+                had_trailing_space = before.endswith(" ")
+                core = before.rstrip()
+                new_line = _cli_tab_complete_line(trie, core)
+                buf = list(new_line)
+                redraw()
+                continue
+            # Printable / UTF-8 continuation handled by read(1) one code point in text mode
+            if ch.isprintable():
+                # If the terminal leaked an unfinished arrow escape as literal
+                # characters (typically `[` followed by `A`/`B`), consume those
+                # fragments so they don't become a command token.
+                if ch in ("A", "B") and buf and buf[-1] == "[":
+                    # Treat leaked arrow fragments as a real up/down key.
+                    buf.pop()
+                    if ch == "A":
+                        hist_up()
+                    else:
+                        hist_down()
+                    redraw()
+                    continue
+                buf.append(ch)
+                if ch == "?":
+                    line = "".join(buf)
+                    exp = (
+                        _cli_expand_full_input_line(trie, line) if trie else line.strip()
+                    )
+                    return finish(exp)
+                redraw()
+    finally:
+        termios.tcsetattr(fd, termios.TCSADRAIN, old)
+
+
+def _showtech_cli_read_line(
+    display: str,
+    hist: List[str],
+    initial: Optional[str] = None,
+    trie: Optional[_ShowTechCommandTrie] = None,
+) -> str:
+    """TTY-aware line read; POSIX uses custom reader so '?' submits without relying on readline."""
+    prompt = f"{display}> "
+    if (
+        not sys.stdin.isatty()
+        or not sys.stdout.isatty()
+        or sys.platform == "win32"
+    ):
+        try:
+            if initial:
+                sys.stdout.write(prompt + initial)
+                sys.stdout.flush()
+                rest = sys.stdin.readline()
+                combined = (initial + rest).strip()
+            else:
+                combined = input(prompt).strip()
+            return _cli_expand_full_input_line(trie, combined)
+        except EOFError:
+            raise
+    try:
+        return _showtech_cli_posix_tty_line(prompt, hist, initial, trie)
+    except (OSError, AttributeError, ValueError, ImportError):
+        if initial:
+            try:
+                sys.stdout.write(prompt + initial)
+                sys.stdout.flush()
+                rest = sys.stdin.readline()
+                combined = (initial + rest).strip()
+            except EOFError:
+                raise
+        else:
+            combined = input(prompt).strip()
+        return _cli_expand_full_input_line(trie, combined)
+
+
+def _populate_showtech_cli_hostname_ctx(
+    source_id: str, blocks: Sequence["CommandBlock"]
+) -> TechSupportContext:
+    """
+    Same hostname-related parsing as run_all_checks (show version + clock + running-config).
+    """
+    ctx = TechSupportContext(source_id, list(blocks))
+    parse_show_version(ctx)
+    parse_show_clock(ctx)
+    populate_hostname_from_running_config(ctx)
+    return ctx
+
+
+def run_interactive_showtech_cli(
+    blocks: Sequence["CommandBlock"],
+    source_id: str,
+) -> None:
+    cli_ctx = _populate_showtech_cli_hostname_ctx(source_id, blocks)
+    trie = _ShowTechCommandTrie(blocks)
+    hn = cli_ctx.hostname
+    if hn:
+        disp = hn if len(hn) <= 56 else hn[:53] + "..."
+    else:
+        short = Path(source_id).name
+        disp = short if len(short) <= 56 else "..." + short[-53:]
+    hist: List[str] = []
+    print(
+        "Interactive show-tech CLI (first bundle). Commands: EOS-style abbreviations; "
+        "'?' or 'word?' for next keywords (typing ? submits the line on POSIX TTY); "
+        "Space/Enter/Tab expand unique abbreviations (Tab also lists candidates); "
+        "'| grep PAT' / '| include PAT'; Up/Down recall prior commands; exit/quit/^D to leave."
+    )
+    pending_initial: Optional[str] = None
+    while True:
+        try:
+            init_line = pending_initial
+            pending_initial = None
+            raw = _showtech_cli_read_line(
+                disp, hist, init_line if init_line else None, trie
+            )
+        except EOFError:
+            print()
+            break
+        if not raw:
+            continue
+        low = raw.lower()
+        if low in ("exit", "quit", "q"):
+            break
+        append_hist: Optional[str] = None
+        try:
+            if low in ("help", "?"):
+                print(
+                    "Examples:  show ?   show ver   sh ver|grep Arista\n"
+                    "Pagination: Space = next page, q = stop output.\n"
+                    "Line editing: Up/Down history; ASCII ? submits the line on POSIX TTY.\n"
+                    "Space/Enter/Tab expand unique token abbreviations; Tab lists next keywords if needed.\n"
+                    "After '?' help the command prefix is kept on the next line."
+                )
+                continue
+
+            cmd_part, pipe_pat, pipe_kind = _parse_showtech_cli_pipe(raw)
+            help_spec = _parse_showtech_cli_help(cmd_part)
+
+            if help_spec is not None:
+                prefix_tokens, partial = help_spec
+                # Keep original values for debug visibility.
+                orig_prefix_tokens, orig_partial = list(prefix_tokens), partial
+                prefix_tokens, partial = _cli_refine_help_prefix(
+                    trie, list(prefix_tokens), partial
+                )
+                # List next-level keywords under the refined trie prefix using the
+                # (possibly reduced) partial filter.
+                keys, err = trie.help_candidates(prefix_tokens, partial)
+                if err:
+                    print(err)
+                    resume_err = _cli_resume_line_after_help(raw)
+                    if resume_err:
+                        pending_initial = resume_err
+                    continue
+                assert keys is not None
+                if not keys:
+                    print("(no matching next-level commands)")
+                else:
+                    print("\n".join(keys))
+                print()
+                # For '?' help, we prefill the next prompt based on the refined
+                # prefix_tokens/partial we just computed (not on the raw string).
+                # When partial == '' (i.e. the current token is unambiguous and fully
+                # resolved), we must append a trailing space so the user can
+                # immediately continue typing the next keyword.
+                if partial == "":
+                    resume = (" ".join(prefix_tokens) + " ") if prefix_tokens else ""
+                else:
+                    resume = " ".join(prefix_tokens + [partial]) if prefix_tokens else partial
+
+                pending_initial = resume
+                continue
+
+            tokens = cmd_part.split()
+            matched, err = trie.resolve_blocks(tokens)
+            ambiguous = bool(err and err.startswith("Ambiguous"))
+            if ambiguous:
+                print(err)
+                continue
+            if err:
+                # Strict tree semantics: if the trie says "incomplete" / "unknown token",
+                # we must not fallback to loose prefix execution.
+                if err.startswith("Incomplete command"):
+                    # Record incomplete commands too, so Up/Down can find them.
+                    append_hist = raw
+                print(err)
+                continue
+            if not matched:
+                print("No match.")
+                continue
+
+            # Requirement: history should only record commands that resolve to
+            # runnable leaf nodes (no further trie children).
+            node, err2 = trie._walk_prefix(tokens)
+            is_leaf = bool(node is not None and not node.children)
+            if err2:
+                is_leaf = False
+
+            body = _format_showtech_cli_matches(matched)
+            body = _showtech_cli_apply_grep(body, pipe_pat, pipe_kind)
+            _showtech_cli_paginate(body)
+            if is_leaf:
+                # Only record successful leaf-node commands.
+                append_hist = raw
+        finally:
+            if append_hist is not None:
+                hist.append(append_hist)
+                if len(hist) > 500:
+                    hist[:] = hist[-500:]
+                # Note: history only records runnable leaf-node commands.
+
+
 def process_single_task(task: ProcessingTask) -> Tuple[str, str]:
     """
     Process a single file task and return (source_id, report).
@@ -4937,12 +5769,37 @@ def main(argv: Optional[Sequence[str]] = None) -> None:
     )
     
     if not tasks:
-        # For -L / -r extraction modes, returning success is misleading.
-        if args.list_showtech_commands or args.raw_command is not None:
-            print("error: no show-tech/show-tech-support-all files found for -L/-r under given PATH", file=sys.stderr)
+        # For -L / -r / --cli extraction modes, returning success is misleading.
+        if (
+            args.list_showtech_commands
+            or args.raw_command is not None
+            or getattr(args, "cli", False)
+        ):
+            print(
+                "error: no show-tech/show-tech-support-all files found for -L/-r/--cli under given PATH",
+                file=sys.stderr,
+            )
             sys.exit(1)
         LOG.warning("No show-tech files found to process.")
         return
+
+    if getattr(args, "cli", False):
+        if len(tasks) > 1:
+            print(
+                f"warning: --cli uses first show-tech only ({tasks[0].source_id!r}); "
+                f"{len(tasks) - 1} other file(s) ignored.",
+                file=sys.stderr,
+            )
+        cli_task = tasks[0]
+        text = load_task_text(cli_task)
+        st_parser = TechSupportParser()
+        cli_blocks = st_parser.parse(text)
+        del text
+        del st_parser
+        if cli_task.text is not None:
+            cli_task.text = None
+        run_interactive_showtech_cli(cli_blocks, cli_task.source_id)
+        sys.exit(0)
 
     if args.list_showtech_commands or args.raw_command is not None:
         ec, extract_out = run_showtech_command_extract(
