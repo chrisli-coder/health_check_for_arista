@@ -4845,13 +4845,15 @@ def _cli_expand_full_input_line(trie: Optional[_ShowTechCommandTrie], s: str) ->
     if not trie:
         return s.strip()
     s = s.rstrip("\r\n")
-    idx = s.find("|")
-    if idx >= 0:
-        left = s[:idx].rstrip()
-        right = s[idx:]
+    # Only treat `|` as a "pipe tail" splitter for `| grep/include ...`.
+    # For show-tech commands that literally contain `|` as a keyword (e.g. `... recent | nz`),
+    # keep it in the command token stream so abbreviation/Tab completion works naturally.
+    m_pipe = _SHOWTECH_CLI_PIPE_RE.search(s)
+    if m_pipe:
+        left = s[: m_pipe.start()].rstrip()
+        right = s[m_pipe.start() :]
     else:
-        left = s
-        right = ""
+        left, right = s, ""
 
     q = ""
     if left.endswith("?"):
@@ -4890,7 +4892,8 @@ def _cli_tab_complete_line(trie: _ShowTechCommandTrie, core: str) -> str:
     """
     exp = _cli_expand_full_input_line(trie, core)
     if exp != core:
-        idx0 = core.find("|")
+        m0 = _SHOWTECH_CLI_PIPE_RE.search(core)
+        idx0 = m0.start() if m0 else -1
         right0 = core[idx0:] if idx0 >= 0 else ""
         if not right0.strip():
             e = exp.rstrip()
@@ -4899,7 +4902,8 @@ def _cli_tab_complete_line(trie: _ShowTechCommandTrie, core: str) -> str:
             ret = exp.strip()
         return ret
 
-    idx = core.find("|")
+    m = _SHOWTECH_CLI_PIPE_RE.search(core)
+    idx = m.start() if m else -1
     if idx >= 0:
         left = core[:idx].rstrip()
         right = core[idx:]
@@ -4924,7 +4928,8 @@ def _cli_tab_complete_line(trie: _ShowTechCommandTrie, core: str) -> str:
         if not keys:
             return core
         if len(keys) == 1:
-            return merge(keys[0], space_after=True)
+            ret0 = merge(keys[0], space_after=True)
+            return ret0
         print("\n" + "\n".join(keys), flush=True)
         return core
 
@@ -4945,19 +4950,22 @@ def _cli_tab_complete_line(trie: _ShowTechCommandTrie, core: str) -> str:
     if len(keys) == 1:
         nk = keys[0]
         if nk != last:
-            return merge(" ".join(pref + [nk]), space_after=True)
+            ret1 = merge(" ".join(pref + [nk]), space_after=True)
+            return ret1
         keys2, err2 = trie.help_candidates(parts, "")
         if err2:
             print(f"\n{err2}", flush=True)
             return core
         if keys2:
             if len(keys2) == 1:
-                return merge(" ".join(parts + [keys2[0]]), space_after=True)
+                ret2 = merge(" ".join(parts + [keys2[0]]), space_after=True)
+                return ret2
             print("\n" + "\n".join(keys2), flush=True)
             # If `last` is an exact keyword and we listed its children (multiple
             # next-level options), keep a trailing space so the user can type
             # the next keyword directly without pressing space manually.
-            return merge(" ".join(parts), space_after=True)
+            ret3 = merge(" ".join(parts), space_after=True)
+            return ret3
         return core
 
     if len(keys) > 1:
@@ -4980,6 +4988,26 @@ def _parse_showtech_cli_pipe(
     """
     m = _SHOWTECH_CLI_PIPE_RE.search(line)
     if not m:
+        # Normalize bare pipe tokens for command resolution so `|nz` behaves like `| nz`.
+        # Do NOT do this for `| grep/include ...` because the pattern portion may contain '|'.
+        if "|" in line:
+            normalized = re.sub(r"\s*\|\s*", " | ", line)
+            normalized = " ".join(normalized.strip().split())
+            # If user typed repeated pipes (e.g. `... | | |`), collapse them and drop trailing pipes.
+            # This avoids producing an "unknown token '|'" error while still guiding the user.
+            parts = normalized.split()
+            if "|" in parts:
+                collapsed: List[str] = []
+                for p in parts:
+                    if p == "|" and collapsed and collapsed[-1] == "|":
+                        continue
+                    collapsed.append(p)
+                while collapsed and collapsed[-1] == "|":
+                    collapsed.pop()
+                normalized2 = " ".join(collapsed)
+            else:
+                normalized2 = normalized
+            return normalized2, None, None
         return line.strip(), None, None
     cmd = line[: m.start()].strip()
     kind = m.group(1).lower()
