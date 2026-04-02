@@ -2193,6 +2193,7 @@ LOGGING_THRESHOLD_ERROR_PATTERNS = [
     r"\bDRAM_FATAL_INTERRUPT\b",
     # AttrLog buffer exhaustion
     r"AttrLog buffer is full",
+    r"FEC_RESOURCE",
 ]
 
 
