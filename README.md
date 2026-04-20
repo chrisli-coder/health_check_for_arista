@@ -5,19 +5,24 @@ A comprehensive health check tool for analyzing Arista EOS device show-tech file
 **Author**: chris.li@arista.com  
 **Company**: Arista Networks  
 **Version**: 1.3.1  
-**Last Modified**: 2026-04-02
+**Last Modified**: 2026-04-20
 
 ## Description
 
-This tool analyzes Arista EOS show-tech / show-tech-support-all outputs and related support-bundle archives/directories to generate health reports. It supports multiple input formats, platform-specific checks, and flexible output modes.
+This tool analyzes Arista EOS show-tech / show-tech-support-all outputs and related support-bundle archives/directories to generate health reports. It supports multiple input formats, platform-specific checks, and flexible output modes. You can pass many paths in one invocation (including several archives at once); filename wildcards are handled by your shell, which expands them into separate path arguments before the tool runs.
 
 ## Features
 
 - **Multiple Input Formats**:
-  - Single or multiple show-tech files
-  - Unpacked support-bundle directories
-  - Single support-bundle archive files (zip, tar, tar.gz, tgz)
+  - Single or multiple show-tech files in one run
+  - Unpacked support-bundle directories (one or more)
+  - Support-bundle archives (zip, tar, tar.gz, tgz), including many archives in one command (for example after shell glob expansion)
   - Nested archives (archives containing other archives)
+
+- **Batch and wildcard-friendly workflow**:
+  - Any number of `PATH` arguments: mix files, directories, and archives
+  - Typical patterns such as `*.zip`, `bundle-*.tar.gz`, or `site1/*.tgz` are expanded by **bash/zsh** (or your shell) into multiple paths; the tool then discovers show-tech in each input and can process them in parallel (see **Performance**)
+  - If a glob matches nothing, behavior depends on the shell (bash often passes the pattern literally; zsh may error by default). Use `shopt -s nullglob` in bash, or zsh options such as `NULL_GLOB` / `NONOMATCH`, if you want “no match” to expand to nothing instead of a bad path
 
 - **Platform Support** (phased implementation):
   - Phase 1: 78xx series
@@ -36,6 +41,7 @@ This tool analyzes Arista EOS show-tech / show-tech-support-all outputs and rela
 - **Show-tech command introspection** (no health checks run):
   - `-L / --list-showtech-commands`: List each **bundle** command section in parse order (`------------- show … -------------` / `------------- bash … -------------`). In-output dashed headings (e.g. table titles) are ignored.
   - `-r / --raw COMMAND`: Print the full captured output for that command (case-insensitive; exact match first, then prefix). Quote multi-word commands.
+  - `--cli`: Interactive EOS-style CLI over the first show-tech found under the given paths (abbreviations, `?`, paging, `| grep` / `| include`). Does not run health checks; if multiple inputs resolve to multiple show-techs, only the first is used (a warning is printed).
 
 - **Comprehensive Health Checks**:
   - System information (version, uptime, memory, temperature, cooling)
@@ -76,12 +82,25 @@ python3 health_check_eos.py /path/to/support-bundle.zip
 # Analyze multiple inputs
 python3 health_check_eos.py file1 file2 directory1 archive.zip
 
+# Many archives at once (shell expands the glob into separate paths)
+python3 health_check_eos.py /data/bundles/*.zip
+
 # List every command section in a show-tech file (section headers only)
 python3 health_check_eos.py -L /path/to/show-tech
 
 # Dump the raw output of one section (quote the command if it contains spaces)
 python3 health_check_eos.py -r "show version" /path/to/show-tech
 ```
+
+### Multiple paths, wildcards, and archives
+
+- The trailing `PATH ...` arguments accept **any number** of inputs. Each path is classified independently as a plain show-tech file, an unpacked support-bundle tree, or an archive (zip / tar / tar.gz / tgz).
+- **Wildcards** (`*`, `?`, `[…]`) are not interpreted inside Python’s argparse; your **shell** expands them before arguments reach the script. Examples (POSIX shell):
+  - `python3 health_check_eos.py *.zip` — all zip archives in the current directory
+  - `python3 health_check_eos.py -t 4 ~/downloads/switch-*.tar.gz` — several tarballs with up to four worker threads
+- To pass a literal `*` in a path, quote it: `'file*.zip'`.
+- With multiple inputs, reports are printed **in order**, separated by a blank line between each file’s output (same when writing to `-o`).
+- Parallelism (`-t`) speeds up **multiple independent show-tech tasks** (multiple files or multiple archives). A single huge archive still corresponds to one primary parse task per discovered show-tech inside it.
 
 ### Command Line Options
 
@@ -96,13 +115,14 @@ python3 health_check_eos.py -r "show version" /path/to/show-tech
 
 #### Output Control
 
-- `-o FILE, --output FILE`: Write report (or `-L` / `-r` extract output) to FILE instead of stdout
+- `-o FILE, --output FILE`: Write the health report, or `-L` / `-r` extract output, to FILE instead of stdout (not used with `--cli`, which is interactive-only)
 
 #### Information and Filtering
 
 - `-l, --list-checks`: List all supported health checks and exit
-- `-L, --list-showtech-commands`: List all command section headers from the show-tech input(s) in order and exit (requires PATH; does not run health checks). Mutually exclusive with `-r` / `--raw`.
-- `-r COMMAND, --raw COMMAND`: Dump the raw text captured for `COMMAND` and exit (requires PATH; does not run health checks). Matching is case-insensitive: exact normalized command first, otherwise prefix match over sections in file order. If the same command appears multiple times, every matching section is printed with `match i/n` headers. Exit code `1` if a given input has no matching section. Mutually exclusive with `-L`.
+- `-L, --list-showtech-commands`: List all command section headers from the show-tech input(s) in order and exit (requires PATH; does not run health checks). Mutually exclusive with `-r` / `--raw` / `--cli`.
+- `-r COMMAND, --raw COMMAND`: Dump the raw text captured for `COMMAND` and exit (requires PATH; does not run health checks). Matching is case-insensitive: exact normalized command first, otherwise prefix match over sections in file order. If the same command appears multiple times, every matching section is printed with `match i/n` headers. Exit code `1` if a given input has no matching section. Mutually exclusive with `-L` / `--cli`.
+- `--cli`: Start the interactive show-tech CLI on the **first** resolved show-tech (requires PATH; does not run health checks). Mutually exclusive with `-L` / `-r`.
 
 - `-c [CHECK_NAME ...], --show-checks-in-brief [CHECK_NAME ...]`: 
   - Show specified checks in brief mode output (full output for selected checks, not truncated)
@@ -122,14 +142,13 @@ python3 health_check_eos.py -r "show version" /path/to/show-tech
 
 - `-t N, --threads N`: Number of worker threads for parallel processing
   - Default: number of CPU cores (capped at 8 for memory efficiency)
-  - Set to 1 to disable parallel processing
+  - Set to 1 to disable parallel processing (recommended on very small VMs or shared jump hosts where you must avoid loading the machine)
 - `-m, --low-memory`: Enable low-memory mode
-  - Files are loaded on-demand instead of pre-loading all files
-  - Reduces memory usage at the cost of slightly slower processing
-  - Recommended for systems with limited RAM or when processing many large files
-  - In low-memory mode, thread count is automatically reduced (max 2 threads)
-  - Tasks are processed in batches to avoid loading too many files simultaneously
-  - Useful for processing multiple files or archives in batch
+  - Files are loaded on-demand instead of pre-loading entire archives/files up front
+  - Reduces peak memory at the cost of some extra I/O and often slower runs
+  - Intended primarily for **low-performance or memory-tight environments**—for example **tac-sftp**-class servers, small shared SFTP VMs, or other boxes with little RAM and slow storage where the default “load everything” behavior risks OOM or heavy swapping
+  - If you do **not** pass `-t`, low-memory mode uses a **conservative default** (at most 2 worker threads). You may still set `-t N` explicitly if you need a different cap on that host
+  - When there are many tasks, low-memory mode may process them in **batches** so only a limited number of files are in flight at once
 
 #### Help
 
@@ -199,18 +218,21 @@ python3 health_check_eos.py --threads 4 *.zip
 # Disable parallel processing (single-threaded)
 python3 health_check_eos.py -t 1 /path/to/show-tech
 
-# Low-memory mode for systems with limited RAM
+# Low-memory mode (best on tac-sftp / small SFTP VMs / low-RAM jump hosts)
 python3 health_check_eos.py -m /path/to/show-tech
 # or
 python3 health_check_eos.py --low-memory /path/to/show-tech
 # or
 python3 health_check_eos.py -m *.zip
 
-# Low-memory mode with custom thread count (will be capped at 2)
-python3 health_check_eos.py -m -t 4 large_archive*.zip
+# Low-memory + single-thread (gentlest on CPU and I/O for shared servers)
+python3 health_check_eos.py -m -t 1 large_archive*.zip
 
 # Process multiple archives with parallel processing
 python3 health_check_eos.py -t 8 archive1.zip archive2.zip archive3.zip
+
+# Interactive show-tech CLI (first matching show-tech only if several are found)
+python3 health_check_eos.py --cli /path/to/show-tech
 ```
 
 ## Health Checks
@@ -332,64 +354,45 @@ The tool automatically detects input type (file, directory, or archive) and sear
 - Files in support-bundle directories: `support-bundle/tmp/support-bundle-cmds/show-tech`
 - Files in nested archives
 
-## Performance Optimization
+## Performance and resource limits
 
-### Parallel Processing
+On a normal laptop or build host, defaults are tuned for speed: each task may preload full file text, and the worker pool size follows CPU count (up to eight threads). On **underpowered shared infrastructure**—especially **tac-sftp-style** machines that only host uploads, have little RAM, slow disks, or strict CPU quotas—you should treat **`-m` (low-memory)** and **`-t 1`** as the primary levers so one analysis does not exhaust the box for other users.
 
-The tool supports multi-threaded processing for improved performance when handling multiple files:
+### Parallel processing (`-t`)
 
-- **Default behavior**: Automatically uses the number of CPU cores (capped at 8) for parallel processing
-- **Custom thread count**: Use `-t N` or `--threads N` to specify the number of worker threads
-- **Single-threaded mode**: Use `-t 1` to disable parallel processing (useful for debugging or memory-constrained environments)
+The tool uses a thread pool so **multiple show-techs** (from multiple paths or multiple members inside archives) can be analyzed concurrently.
 
-**When to use parallel processing:**
-- Processing multiple show-tech files
-- Processing multiple archive files
-- Batch processing scenarios
+- **Default**: Worker count follows CPU cores, capped at eight, to balance throughput and RAM
+- **`-t N`**: Set the pool size explicitly (for example `-t 2` on a four-core SFTP VM)
+- **`-t 1`**: Fully sequential—best for debugging, or when the host must stay idle-friendly (common on tac-sftp or similar)
 
-**Performance tips:**
-- For I/O-bound workloads (reading from disk/archives), parallel processing provides significant speedup
-- For CPU-bound workloads (parsing large files), moderate thread counts (4-8) work best
-- Memory usage increases with thread count, so adjust `-t` based on available RAM
+**Good fits for parallelism:** many separate files or archives, or many discovered show-techs where work is spread across tasks.
 
-Example:
+**Caveat:** Peak memory scales with how many large bodies are loaded at once; if the host is small, prefer **`-m`** and/or a lower **`-t`** even when processing many globs.
+
 ```bash
-# Process 10 archive files using 4 threads
+# Many archives expanded by the shell; four workers
 python3 health_check_eos.py -t 4 archive*.zip
 
-# Process multiple directories in parallel
+# Several unpacked trees at once
 python3 health_check_eos.py -t 8 dir1/ dir2/ dir3/
 ```
 
-### Low-Memory Mode
+### Low-memory mode (`-m`)
 
-For systems with limited RAM or when processing many large files, use `--low-memory` mode:
+**Primary audience:** low-RAM or I/O-weak servers (for example **tac-sftp** hosts, minimal cloud instances, or crowded jump boxes) where preloading every bundle into memory is risky.
 
-**How it works:**
-- Files are loaded on-demand instead of pre-loading all files into memory
-- Tasks are processed in batches to avoid loading too many files simultaneously
-- Thread count is automatically reduced (max 2 threads) to minimize memory pressure
-- Memory is released immediately after each file is processed
+**Behavior (summary):**
+- Archive and file contents are **read on demand** when a task runs, instead of loading everything up front where that path applies
+- With many tasks, processing may occur in **batches** so only a subset of files is active at a time
+- If you omit **`-t`**, the default worker count in low-memory mode stays **small** (at most two threads) to limit concurrent large reads
+- You can still pass **`-t 1`** for the lightest footprint, or a higher **`-t`** if you measured that the host can sustain it
 
-**When to use:**
-- Systems with limited RAM (< 4GB available)
-- Processing many large files (> 10 files or files > 100MB each)
-- Nested archives with large outer archives
-- Avoiding out-of-memory errors
+**Trade-off:** usually lower peak RAM and less risk of OOM, often at the cost of longer wall-clock time.
 
-**Performance trade-off:**
-- Slightly slower processing due to on-demand loading
-- Reduced peak memory usage (typically 50-70% reduction)
-
-Example:
 ```bash
-# Process many large files in low-memory mode
 python3 health_check_eos.py -m *.zip
-# or
-python3 health_check_eos.py --low-memory *.zip
-
-# Combine with custom thread count (will be capped at 2 in low-memory mode)
-python3 health_check_eos.py -m -t 4 large_archive*.zip
+python3 health_check_eos.py -m -t 1 *.zip   # safest pattern on a busy tac-sftp server
 ```
 
 ## Troubleshooting
@@ -411,11 +414,11 @@ Use `-c` or `--show-checks-in-brief` to view full output of specific checks in b
 
 ## Notes
 
-- **Memory management**: By default, the tool loads files into memory for fast processing, then releases memory. Use `--low-memory` mode for systems with limited RAM.
+- **Memory and CPU**: Default mode favors speed on capable machines. Use **`-m`** (and often **`-t 1`**) on **tac-sftp-class** or other **low-performance** servers where aggressive parallelism and full preloads are a bad fit.
+- **Wildcards** are a shell feature: the program receives a list of paths; ensure your shell expands globs as you expect (or use explicit paths / `find` / `xargs` if globs are unavailable, for example in some non-interactive contexts).
 - Command blocks in show-tech files are identified by `---` delimiters (e.g., `------------- show—cmd -------------`)
 - Some checks are platform-specific and will return INFO if the platform doesn't match
 - The tool supports nested archives (archives containing other archives)
-- In low-memory mode, files are loaded on-demand and processed in batches to minimize memory usage
 
 ## License
 
