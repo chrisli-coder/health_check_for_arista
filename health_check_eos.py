@@ -30,7 +30,7 @@ import tarfile
 import zipfile
 from dataclasses import dataclass, field
 from enum import Enum
-from typing import Dict, Iterable, List, Optional, Sequence, Tuple
+from typing import Callable, Dict, Iterable, List, Optional, Sequence, Tuple
 
 __author__ = "chris.li@arista.com"
 __last_modified__ = "2026-05-20"
@@ -764,6 +764,102 @@ class LiveCollectionError(RuntimeError):
     """Raised when collecting commands from a live device fails."""
 
 
+class LiveProgress:
+    """Thread-safe stderr progress reporter for live device collection.
+
+    Auto-disables when stderr is not a TTY or when debug logging is on (debug
+    logs would interleave badly with a redrawing status line).
+    """
+
+    def __init__(self, total_devices: int, debug: bool = False):
+        import threading as _threading
+        self.total = total_devices
+        self.enabled = (
+            total_devices > 0
+            and sys.stderr.isatty()
+            and not debug
+        )
+        self.done = 0
+        self.failed = 0
+        self._active: "Dict[str, str]" = {}
+        self._lock = _threading.Lock()
+        self._last_len = 0
+
+    # --- callbacks -------------------------------------------------------
+
+    def device_started(self, host: str) -> None:
+        self._update(host, "connecting")
+
+    def device_stage(self, host: str, stage: str) -> None:
+        self._update(host, stage)
+
+    def device_cmd(self, host: str, done: int, total: int, cmd: str) -> None:
+        # Trim long commands so the line stays readable.
+        short = cmd if len(cmd) <= 40 else cmd[:37] + "..."
+        self._update(host, f"[{done}/{total}] {short}")
+
+    def device_finished(self, host: str, ok: bool = True) -> None:
+        with self._lock:
+            self._active.pop(host, None)
+            if ok:
+                self.done += 1
+            else:
+                self.failed += 1
+            self._render_locked()
+
+    def close(self) -> None:
+        """Erase the status line and emit a final summary on its own line."""
+        with self._lock:
+            if not self.enabled:
+                return
+            self._clear_locked()
+            summary = f"Live collection: {self.done}/{self.total} ok"
+            if self.failed:
+                summary += f", {self.failed} failed"
+            sys.stderr.write(summary + "\n")
+            sys.stderr.flush()
+
+    # --- internals -------------------------------------------------------
+
+    def _update(self, host: str, stage: str) -> None:
+        with self._lock:
+            self._active[host] = stage
+            self._render_locked()
+
+    def _render_locked(self) -> None:
+        if not self.enabled:
+            return
+        if self.total > 1:
+            if self._active:
+                items = list(self._active.items())
+                shown = items[:2]
+                tail = "; ".join(f"{h}: {s}" for h, s in shown)
+                if len(items) > 2:
+                    tail += f" (+{len(items) - 2} more)"
+            else:
+                tail = "-"
+            counter = f"{self.done}/{self.total}"
+            if self.failed:
+                counter += f" ({self.failed} failed)"
+            text = f"[{counter}] {tail}"
+        else:
+            if self._active:
+                host, stage = next(iter(self._active.items()))
+                text = f"{host}: {stage}"
+            else:
+                text = f"done ({self.done}/{self.total})"
+        pad = max(0, self._last_len - len(text))
+        sys.stderr.write("\r" + text + (" " * pad))
+        sys.stderr.flush()
+        self._last_len = len(text)
+
+    def _clear_locked(self) -> None:
+        if self._last_len:
+            sys.stderr.write("\r" + " " * self._last_len + "\r")
+            sys.stderr.flush()
+            self._last_len = 0
+
+
 @dataclass
 class DeviceCredentials:
     host: str
@@ -794,11 +890,25 @@ def _assemble_showtech_text(outputs: Dict[str, str], command_order: Sequence[str
     return "\n".join(parts)
 
 
-def fetch_via_eapi(creds: DeviceCredentials, commands: Sequence[str]) -> Dict[str, str]:
+def fetch_via_eapi(
+    creds: DeviceCredentials,
+    commands: Sequence[str],
+    progress_cb: Optional[Callable[[int, int, str], None]] = None,
+) -> Dict[str, str]:
     """Single JSON-RPC runCmds call (format=text). stdlib only.
 
     Returns dict mapping each command to its raw text output.
+
+    progress_cb, if given, is called once before the request as
+    (0, len(commands), "eapi: collecting N commands") so callers can
+    surface a coarse stage indicator. eAPI returns all commands in one
+    response, so per-command progress isn't available.
     """
+    if progress_cb is not None:
+        try:
+            progress_cb(0, len(commands), f"eapi: collecting {len(commands)} cmds")
+        except Exception:
+            pass
     import base64
     import json as _json
     import ssl
@@ -893,11 +1003,18 @@ def _json_dumps_safe(obj: object) -> str:
         return str(obj)
 
 
-def fetch_via_ssh(creds: DeviceCredentials, commands: Sequence[str]) -> Dict[str, str]:
+def fetch_via_ssh(
+    creds: DeviceCredentials,
+    commands: Sequence[str],
+    progress_cb: Optional[Callable[[int, int, str], None]] = None,
+) -> Dict[str, str]:
     """SSH fallback using paramiko (optional dependency).
 
     Opens one interactive shell, disables paging, then sends each command and
     splits responses on the device prompt.
+
+    progress_cb, if given, is invoked as (i, total, cmd) before each command
+    is sent so callers can render per-command progress.
     """
     try:
         import paramiko  # type: ignore
@@ -931,7 +1048,13 @@ def fetch_via_ssh(creds: DeviceCredentials, commands: Sequence[str]) -> Dict[str
         _ssh_drain(chan, settle=0.5)
         chan.send("terminal width 32767\n")
         _ssh_drain(chan, settle=0.3)
-        for cmd in commands:
+        total = len(commands)
+        for i, cmd in enumerate(commands, start=1):
+            if progress_cb is not None:
+                try:
+                    progress_cb(i, total, cmd)
+                except Exception:
+                    pass
             chan.send(cmd + "\n")
             text = _ssh_drain(chan, settle=2.0)
             out[cmd] = _ssh_strip_prompt(text, cmd)
@@ -982,8 +1105,14 @@ def fetch_device_output(
     creds: DeviceCredentials,
     commands: Sequence[str],
     use_tech_support: bool = False,
+    progress_cb: Optional[Callable[[int, int, str], None]] = None,
 ) -> str:
-    """Collect commands from a device and return show-tech-style text."""
+    """Collect commands from a device and return show-tech-style text.
+
+    progress_cb (if given) receives (current, total, stage_or_cmd) updates
+    suitable for a live progress display. For SSH it fires per-command; for
+    eAPI only a single coarse stage event is reported.
+    """
     if use_tech_support:
         cmds = ["show tech-support all"]
     else:
@@ -1002,9 +1131,9 @@ def fetch_device_output(
     for t in transports:
         try:
             if t == "eapi":
-                outputs = fetch_via_eapi(creds, cmds)
+                outputs = fetch_via_eapi(creds, cmds, progress_cb=progress_cb)
             else:
-                outputs = fetch_via_ssh(creds, cmds)
+                outputs = fetch_via_ssh(creds, cmds, progress_cb=progress_cb)
             if outputs:
                 LOG.debug("Collected %d/%d commands from %s via %s",
                           len(outputs), len(cmds), creds.host, t)
@@ -5049,6 +5178,7 @@ class ProcessingTask:
     live_commands: Optional[List[str]] = None
     live_use_tech_support: bool = False
     live_save_dir: Optional[Path] = None
+    live_progress: Optional["LiveProgress"] = None
 
 
 def load_task_text(task: ProcessingTask) -> str:
@@ -5061,11 +5191,28 @@ def load_task_text(task: ProcessingTask) -> str:
         return read_text_from_archive_member(task.lazy_archive_path, task.lazy_archive_spec)
     if task.live_creds is not None:
         cmds = task.live_commands or collect_required_commands()
-        text = fetch_device_output(
-            task.live_creds, cmds, use_tech_support=task.live_use_tech_support
-        )
+        host = task.live_creds.host
+        progress = task.live_progress
+        cb: Optional[Callable[[int, int, str], None]] = None
+        if progress is not None:
+            progress.device_started(host)
+
+            def cb(done: int, total: int, stage: str, _h: str = host,
+                   _p: "LiveProgress" = progress) -> None:
+                _p.device_cmd(_h, done, total, stage)
+
+        try:
+            text = fetch_device_output(
+                task.live_creds,
+                cmds,
+                use_tech_support=task.live_use_tech_support,
+                progress_cb=cb,
+            )
+        finally:
+            if progress is not None:
+                progress.device_stage(host, "parsing")
         if task.live_save_dir is not None:
-            _save_live_collection(task.live_save_dir, task.live_creds.host, text)
+            _save_live_collection(task.live_save_dir, host, text)
         return text
     raise ValueError(
         f"Cannot load text for task {task.source_id}: missing lazy-load fields"
@@ -6302,10 +6449,14 @@ def main(argv: Optional[Sequence[str]] = None) -> None:
         sys.exit(2)
 
     low_memory = getattr(args, 'low_memory', False)
+    live_progress: Optional[LiveProgress] = None
     if getattr(args, "live", False) or getattr(args, "inventory", None):
         LOG.info("Live mode: collecting tasks for %d device(s)...",
                  len(args.paths or []) + (1 if args.inventory else 0))
         tasks = collect_live_tasks(args)
+        live_progress = LiveProgress(total_devices=len(tasks), debug=args.debug)
+        for t in tasks:
+            t.live_progress = live_progress
     else:
         # Collect all processing tasks
         LOG.info("Collecting processing tasks from %d path(s)...", len(args.paths))
@@ -6403,6 +6554,11 @@ def main(argv: Optional[Sequence[str]] = None) -> None:
             LOG.info("Processing: %s", task.source_id)
             source_id, report = process_single_task(task)
             outputs.append(report)
+            if live_progress is not None and task.live_creds is not None:
+                live_progress.device_finished(
+                    task.live_creds.host,
+                    ok=not report.startswith("Error processing "),
+                )
             # Release task text reference immediately after processing
             del task.text
         
@@ -6434,14 +6590,22 @@ def main(argv: Optional[Sequence[str]] = None) -> None:
                     for future in concurrent.futures.as_completed(future_to_index.keys()):
                         idx = future_to_index[future]
                         task = batch_tasks[idx]
+                        task_ok = True
                         try:
                             source_id, report = future.result()
                             batch_results[idx] = report
+                            if report.startswith("Error processing "):
+                                task_ok = False
                             LOG.info("Completed: %s", source_id)
                         except Exception as exc:
                             LOG.error("Task %s raised an exception: %s", task.source_id, exc, exc_info=args.debug)
                             batch_results[idx] = f"Error processing {task.source_id}: {exc}"
+                            task_ok = False
                         finally:
+                            if live_progress is not None and task.live_creds is not None:
+                                live_progress.device_finished(
+                                    task.live_creds.host, ok=task_ok
+                                )
                             # Release task text reference immediately after processing
                             if task.text is not None:
                                 del task.text
@@ -6471,14 +6635,22 @@ def main(argv: Optional[Sequence[str]] = None) -> None:
                 for future in concurrent.futures.as_completed(future_to_index.keys()):
                     idx = future_to_index[future]
                     task = tasks[idx]
+                    task_ok = True
                     try:
                         source_id, report = future.result()
                         results[idx] = report
+                        if report.startswith("Error processing "):
+                            task_ok = False
                         LOG.info("Completed: %s", source_id)
                     except Exception as exc:
                         LOG.error("Task %s raised an exception: %s", task.source_id, exc, exc_info=args.debug)
                         results[idx] = f"Error processing {task.source_id}: {exc}"
+                        task_ok = False
                     finally:
+                        if live_progress is not None and task.live_creds is not None:
+                            live_progress.device_finished(
+                                task.live_creds.host, ok=task_ok
+                            )
                         # Release task text reference immediately after processing
                         if task.text is not None:
                             del task.text
@@ -6496,8 +6668,11 @@ def main(argv: Optional[Sequence[str]] = None) -> None:
             # Clean up tasks list after thread pool closes
             del tasks
 
+    if live_progress is not None:
+        live_progress.close()
+
     final_output = "\n\n".join(outputs)
-    
+
     # Release outputs list after creating final_output
     del outputs
 
