@@ -6168,8 +6168,18 @@ def _load_inventory_file(path: Path) -> List[Dict[str, object]]:
     """Parse a device inventory file. Tries JSON first, then YAML.
 
     Returns a list of dicts: [{host, user?, password?, port?, transport?, ...}].
+    Raises ValueError with a clean, user-facing message on any failure (missing
+    file, unreadable, malformed JSON+YAML, wrong top-level shape).
     """
-    text = path.read_text(encoding="utf-8")
+    try:
+        text = path.read_text(encoding="utf-8")
+    except FileNotFoundError as exc:
+        raise ValueError(f"Inventory file not found: {path}") from exc
+    except IsADirectoryError as exc:
+        raise ValueError(f"Inventory path is a directory, not a file: {path}") from exc
+    except OSError as exc:
+        raise ValueError(f"Cannot read inventory {path}: {exc}") from exc
+
     import json as _json
     try:
         data = _json.loads(text)
@@ -6181,7 +6191,10 @@ def _load_inventory_file(path: Path) -> List[Dict[str, object]]:
                 f"Inventory {path} is not valid JSON and PyYAML is not installed; "
                 f"install pyyaml or convert to JSON"
             ) from exc
-        data = yaml.safe_load(text)
+        try:
+            data = yaml.safe_load(text)
+        except yaml.YAMLError as exc:
+            raise ValueError(f"Inventory {path} is not valid JSON or YAML: {exc}") from exc
     if isinstance(data, dict) and "devices" in data:
         data = data["devices"]
     if not isinstance(data, list):
@@ -6453,7 +6466,11 @@ def main(argv: Optional[Sequence[str]] = None) -> None:
     if getattr(args, "live", False) or getattr(args, "inventory", None):
         LOG.info("Live mode: collecting tasks for %d device(s)...",
                  len(args.paths or []) + (1 if args.inventory else 0))
-        tasks = collect_live_tasks(args)
+        try:
+            tasks = collect_live_tasks(args)
+        except ValueError as exc:
+            print(f"error: {exc}", file=sys.stderr)
+            sys.exit(2)
         live_progress = LiveProgress(total_devices=len(tasks), debug=args.debug)
         for t in tasks:
             t.live_progress = live_progress
