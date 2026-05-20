@@ -3,7 +3,7 @@
 A comprehensive health check tool for analyzing Arista EOS device show-tech files and support-bundle diagnostic archives.
 
 **Author**: chris.li@arista.com  
-**Version**: 1.4.0  
+**Version**: 1.4.1  
 **Last Modified**: 2026-05-20
 
 ## Description
@@ -307,6 +307,20 @@ management api http-commands
 
 `-t / --threads`, `-o / --output`, `-V / -v / -w / -j`, `-s / -S / -c` all work
 the same as in offline mode and apply across all live devices.
+
+#### Progress display
+
+When stderr is a TTY (and `--debug` is off), live mode shows a single
+self-updating progress line on stderr so long collections aren't mistaken
+for a hang:
+
+- Single device: `host: [5/22] show interfaces counters discards` → `host: parsing`
+- Multiple devices: `[3/10 (1 failed)] host-a: [4/22] show ...; host-b: parsing (+2 more)`
+
+SSH gives per-command progress; eAPI is a single round-trip so only a
+coarse stage event is shown. A final `Live collection: X/Y ok` summary is
+printed once everything finishes. When stderr is redirected to a file or
+pipe, the progress line is suppressed automatically.
 
 ## Health Checks
 
