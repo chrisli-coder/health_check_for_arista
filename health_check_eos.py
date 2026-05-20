@@ -3,12 +3,12 @@
 Arista EOS support-bundle / show-tech health check tool.
 
 Author : chris.li@arista.com
-Company: Arista Networks
-Date   : 2026-04-02
+Date   : 2026-05-20
 
 This script analyses EOS show-tech / show-tech-support-all outputs
 and related support-bundle archives/directories and generates a
-health report in brief or verbose form.
+health report in brief or verbose form. Also supports `--live` to
+collect commands directly from a device over eAPI or SSH.
 """
 
 from __future__ import annotations
@@ -33,9 +33,8 @@ from enum import Enum
 from typing import Dict, Iterable, List, Optional, Sequence, Tuple
 
 __author__ = "chris.li@arista.com"
-__company__ = "Arista Networks"
-__last_modified__ = "2026-04-02"
-__version__ = "1.3.1"
+__last_modified__ = "2026-05-20"
+__version__ = "1.4.0"
 
 
 LOG = logging.getLogger("health_check_eos")
@@ -71,9 +70,11 @@ def build_arg_parser() -> argparse.ArgumentParser:
             "  %(prog)s -L /path/to/show-tech                # List command sections in show-tech\n"
             "  %(prog)s -r \"show version\" /path/to/show-tech # Dump raw output of one section\n"
             "  %(prog)s --cli /path/to/show-tech             # Interactive CLI over show-tech sections\n"
+            "  %(prog)s --live 10.0.0.1 -u admin --insecure  # Live: connect via eAPI, run checks\n"
+            "  %(prog)s --live --inventory hosts.yaml -t 8   # Live: batch from inventory file\n"
+            "  %(prog)s --live 10.0.0.1 -u admin --save out/ # Live: also save show-tech-style file\n"
             "\n"
             "Author  : %(author)s\n"
-            "Company : %(company)s\n"
             "Version : %(version)s (Last modified: %(last)s)"
         ),
     )
@@ -231,6 +232,83 @@ def build_arg_parser() -> argparse.ArgumentParser:
         ),
     )
 
+    live_group = parser.add_argument_group("live device")
+    live_group.add_argument(
+        "--live",
+        action="store_true",
+        help=(
+            "Live mode: treat PATH arguments as device hostnames/IPs and collect "
+            "the commands each check needs directly from the device via eAPI "
+            "(HTTPS/JSON-RPC) or SSH instead of reading show-tech files."
+        ),
+    )
+    live_group.add_argument(
+        "--inventory",
+        metavar="FILE",
+        help=(
+            "Inventory file (JSON or YAML) listing devices for batch live mode. "
+            "Each entry: {host, user?, password?, port?, transport?}. "
+            "Entries combine with any hostnames given as PATH."
+        ),
+    )
+    live_group.add_argument(
+        "-u",
+        "--user",
+        metavar="USER",
+        help="Default username for live device login (overridden per inventory entry).",
+    )
+    live_group.add_argument(
+        "--password",
+        metavar="PASS",
+        help=(
+            "Default password for live device login. Precedence: CLI > env EOS_PASSWORD "
+            "> inventory > interactive prompt. Avoid passing on the command line in shared shells."
+        ),
+    )
+    live_group.add_argument(
+        "--port",
+        type=int,
+        metavar="N",
+        help="eAPI port (defaults: 443 for HTTPS, 80 for --http). SSH always uses 22.",
+    )
+    live_group.add_argument(
+        "--http",
+        action="store_true",
+        help="Use unencrypted HTTP for eAPI instead of HTTPS.",
+    )
+    live_group.add_argument(
+        "--insecure",
+        action="store_true",
+        help="Skip TLS certificate verification for eAPI (common with self-signed certs).",
+    )
+    live_group.add_argument(
+        "--transport",
+        choices=("auto", "eapi", "ssh"),
+        default="auto",
+        help=(
+            "Transport for live collection. Default 'auto' tries eAPI first then falls "
+            "back to SSH. 'eapi' or 'ssh' force a single transport."
+        ),
+    )
+    live_group.add_argument(
+        "-T",
+        "--use-tech-support",
+        action="store_true",
+        help=(
+            "In live mode, run 'show tech-support all' on the device instead of the "
+            "per-check command set. Slower but tolerant of unknown command variants."
+        ),
+    )
+    live_group.add_argument(
+        "--save",
+        metavar="DIR",
+        help=(
+            "After collecting commands from a live device, write the assembled "
+            "show-tech-style text to DIR/<host>-show-tech-<timestamp>.txt for "
+            "offline re-analysis."
+        ),
+    )
+
     return parser
 
 
@@ -239,7 +317,6 @@ def parse_args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
     meta = {
         "prog": parser.prog,
         "author": __author__,
-        "company": __company__,
         "version": __version__,
         "last": __last_modified__,
     }
@@ -262,6 +339,16 @@ def parse_args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
         args.mode = "warn"
     else:
         args.mode = "brief"
+
+    if getattr(args, "live", False) or getattr(args, "inventory", None):
+        if not args.live and args.inventory:
+            args.live = True
+        if not args.paths and not args.inventory:
+            parser.error(
+                "--live requires one or more device hostnames as PATH, or --inventory FILE"
+            )
+        if args.use_tech_support and args.inventory is None and not args.live:
+            parser.error("-T/--use-tech-support requires --live")
 
     return args
 
@@ -669,6 +756,277 @@ def read_text_from_archive_member(archive_path: Path, spec: ArchiveShowTechMembe
 
 
 # ---------------------------------------------------------------------------
+# Live device collection (eAPI + SSH)
+# ---------------------------------------------------------------------------
+
+
+class LiveCollectionError(RuntimeError):
+    """Raised when collecting commands from a live device fails."""
+
+
+@dataclass
+class DeviceCredentials:
+    host: str
+    user: str
+    password: str
+    port: Optional[int] = None       # eAPI port; None = derive from use_https
+    transport: str = "auto"          # "auto" | "eapi" | "ssh"
+    use_https: bool = True
+    verify_tls: bool = False         # eAPI TLS verification (--insecure flips this)
+
+
+def _format_showtech_section(cmd: str, body: str) -> str:
+    """Format one command's output the way TechSupportParser expects.
+
+    Header must begin with "show" or "bash" (per TechSupportParser._header_command)
+    so downstream parsing is identical to an offline show-tech.
+    """
+    body = body.rstrip("\r\n")
+    return f"------------ {cmd} ------------\n{body}\n"
+
+
+def _assemble_showtech_text(outputs: Dict[str, str], command_order: Sequence[str]) -> str:
+    parts: List[str] = []
+    for cmd in command_order:
+        if cmd not in outputs:
+            continue
+        parts.append(_format_showtech_section(cmd, outputs[cmd]))
+    return "\n".join(parts)
+
+
+def fetch_via_eapi(creds: DeviceCredentials, commands: Sequence[str]) -> Dict[str, str]:
+    """Single JSON-RPC runCmds call (format=text). stdlib only.
+
+    Returns dict mapping each command to its raw text output.
+    """
+    import base64
+    import json as _json
+    import ssl
+    import urllib.error
+    import urllib.request
+
+    scheme = "https" if creds.use_https else "http"
+    port = creds.port or (443 if creds.use_https else 80)
+    url = f"{scheme}://{creds.host}:{port}/command-api"
+
+    payload = {
+        "jsonrpc": "2.0",
+        "method": "runCmds",
+        "params": {
+            "version": 1,
+            "cmds": list(commands),
+            "format": "text",
+        },
+        "id": "health_check_eos",
+    }
+    body = _json.dumps(payload).encode("utf-8")
+    auth = base64.b64encode(f"{creds.user}:{creds.password}".encode("utf-8")).decode("ascii")
+    req = urllib.request.Request(
+        url,
+        data=body,
+        headers={
+            "Content-Type": "application/json",
+            "Authorization": f"Basic {auth}",
+        },
+        method="POST",
+    )
+
+    ssl_ctx: Optional[ssl.SSLContext] = None
+    if creds.use_https and not creds.verify_tls:
+        ssl_ctx = ssl._create_unverified_context()
+
+    try:
+        with urllib.request.urlopen(req, timeout=60, context=ssl_ctx) as resp:
+            raw = resp.read()
+    except urllib.error.HTTPError as exc:
+        try:
+            err_body = exc.read().decode("utf-8", "replace")
+        except Exception:
+            err_body = ""
+        raise LiveCollectionError(
+            f"eAPI HTTP {exc.code} from {creds.host}: {exc.reason} {err_body[:200]}"
+        ) from exc
+    except (urllib.error.URLError, OSError) as exc:
+        raise LiveCollectionError(f"eAPI connection to {creds.host} failed: {exc}") from exc
+
+    try:
+        data = _json.loads(raw.decode("utf-8"))
+    except Exception as exc:
+        raise LiveCollectionError(f"eAPI from {creds.host} returned non-JSON: {exc}") from exc
+
+    if "error" in data and data["error"]:
+        # Partial results may be in error.data; still surface text outputs collected so far.
+        err = data["error"]
+        msg = err.get("message", "unknown eAPI error")
+        partial = err.get("data") or []
+        results = [_extract_eapi_text(entry) for entry in partial]
+        if not any(results):
+            raise LiveCollectionError(f"eAPI error from {creds.host}: {msg}")
+        LOG.warning("eAPI partial error from %s: %s", creds.host, msg)
+    else:
+        results = [_extract_eapi_text(entry) for entry in (data.get("result") or [])]
+
+    out: Dict[str, str] = {}
+    for cmd, text in zip(commands, results):
+        if text is not None:
+            out[cmd] = text
+    return out
+
+
+def _extract_eapi_text(entry: object) -> Optional[str]:
+    # eAPI text format returns {"output": "..."} per command.
+    if isinstance(entry, dict):
+        if "output" in entry and isinstance(entry["output"], str):
+            return entry["output"]
+        # JSON format response shouldn't happen here but guard anyway.
+        return _json_dumps_safe(entry)
+    if isinstance(entry, str):
+        return entry
+    return None
+
+
+def _json_dumps_safe(obj: object) -> str:
+    import json as _json
+    try:
+        return _json.dumps(obj, indent=2, sort_keys=True)
+    except Exception:
+        return str(obj)
+
+
+def fetch_via_ssh(creds: DeviceCredentials, commands: Sequence[str]) -> Dict[str, str]:
+    """SSH fallback using paramiko (optional dependency).
+
+    Opens one interactive shell, disables paging, then sends each command and
+    splits responses on the device prompt.
+    """
+    try:
+        import paramiko  # type: ignore
+    except ImportError as exc:
+        raise LiveCollectionError(
+            "SSH transport requires paramiko (pip install paramiko)"
+        ) from exc
+
+    client = paramiko.SSHClient()
+    client.set_missing_host_key_policy(paramiko.AutoAddPolicy())
+    try:
+        client.connect(
+            hostname=creds.host,
+            port=22,
+            username=creds.user,
+            password=creds.password,
+            look_for_keys=False,
+            allow_agent=False,
+            timeout=30,
+        )
+    except Exception as exc:
+        raise LiveCollectionError(f"SSH connection to {creds.host} failed: {exc}") from exc
+
+    out: Dict[str, str] = {}
+    try:
+        chan = client.invoke_shell(width=240, height=10000)
+        chan.settimeout(60)
+        _ssh_drain(chan, settle=1.0)
+        # Disable EOS paging and the welcome prompt; ignore output.
+        chan.send("terminal length 0\n")
+        _ssh_drain(chan, settle=0.5)
+        chan.send("terminal width 32767\n")
+        _ssh_drain(chan, settle=0.3)
+        for cmd in commands:
+            chan.send(cmd + "\n")
+            text = _ssh_drain(chan, settle=2.0)
+            out[cmd] = _ssh_strip_prompt(text, cmd)
+    finally:
+        try:
+            client.close()
+        except Exception:
+            pass
+    return out
+
+
+def _ssh_drain(chan, settle: float = 1.0) -> str:
+    """Read until no new bytes arrive for `settle` seconds."""
+    import time as _time
+    buf: List[bytes] = []
+    deadline = _time.monotonic() + 90  # hard cap per command
+    last_recv = _time.monotonic()
+    while _time.monotonic() < deadline:
+        if chan.recv_ready():
+            chunk = chan.recv(65536)
+            if not chunk:
+                break
+            buf.append(chunk)
+            last_recv = _time.monotonic()
+        else:
+            if _time.monotonic() - last_recv >= settle:
+                break
+            _time.sleep(0.05)
+    return b"".join(buf).decode("utf-8", "replace")
+
+
+_SSH_PROMPT_RE = re.compile(r"(?m)^[\w.\-]+[>#]\s*$")
+
+
+def _ssh_strip_prompt(text: str, cmd: str) -> str:
+    """Remove the echoed command line and the trailing device prompt."""
+    lines = text.splitlines()
+    # Drop the first line if it echoes the command we sent.
+    if lines and cmd.strip() and cmd.strip() in lines[0]:
+        lines = lines[1:]
+    # Drop a trailing prompt line.
+    while lines and _SSH_PROMPT_RE.match(lines[-1].rstrip()):
+        lines.pop()
+    return "\n".join(lines)
+
+
+def fetch_device_output(
+    creds: DeviceCredentials,
+    commands: Sequence[str],
+    use_tech_support: bool = False,
+) -> str:
+    """Collect commands from a device and return show-tech-style text."""
+    if use_tech_support:
+        cmds = ["show tech-support all"]
+    else:
+        cmds = list(commands)
+
+    transports: List[str]
+    if creds.transport == "eapi":
+        transports = ["eapi"]
+    elif creds.transport == "ssh":
+        transports = ["ssh"]
+    else:
+        transports = ["eapi", "ssh"]
+
+    last_err: Optional[Exception] = None
+    outputs: Dict[str, str] = {}
+    for t in transports:
+        try:
+            if t == "eapi":
+                outputs = fetch_via_eapi(creds, cmds)
+            else:
+                outputs = fetch_via_ssh(creds, cmds)
+            if outputs:
+                LOG.debug("Collected %d/%d commands from %s via %s",
+                          len(outputs), len(cmds), creds.host, t)
+                break
+        except LiveCollectionError as exc:
+            last_err = exc
+            LOG.info("Transport %s failed for %s: %s", t, creds.host, exc)
+            continue
+
+    if not outputs:
+        raise LiveCollectionError(
+            f"Failed to collect from {creds.host} via {transports}: {last_err}"
+        )
+
+    if use_tech_support:
+        # `show tech-support all` already contains the section dividers; return verbatim
+        # so TechSupportParser picks the same sections an offline file would.
+        return outputs.get("show tech-support all", "")
+    return _assemble_showtech_text(outputs, cmds)
+
+
+# ---------------------------------------------------------------------------
 # Basic parsers for show version / clock
 # ---------------------------------------------------------------------------
 
@@ -894,12 +1252,24 @@ class BaseCheck:
     name: str = "base"
     category: str = "generic"
     supported_platforms: Sequence[str] = ("all",)
+    # CLI commands this check needs from the device, used by --live collection
+    # to know what to query. Each entry must match the prefix passed to
+    # ctx.get_blocks() so live and offline runs produce identical results.
+    required_commands: Sequence[str] = ()
 
     def run(self, ctx: TechSupportContext) -> List[CheckResult]:
         raise NotImplementedError
 
 
 REGISTERED_CHECKS: List[BaseCheck] = []
+
+# Commands consumed by the metadata parsers / hostname helper / report formatter,
+# independent of any specific check.
+_METADATA_COMMANDS: Tuple[str, ...] = (
+    "show version",
+    "show clock",
+    "show running-config sanitized",
+)
 
 
 def register_check(cls):
@@ -915,6 +1285,14 @@ def platform_supported(check: BaseCheck, platform: str) -> bool:
     return platform in check.supported_platforms
 
 
+def collect_required_commands() -> List[str]:
+    """Union of every registered check's required_commands plus metadata commands."""
+    cmds: set = set(_METADATA_COMMANDS)
+    for chk in REGISTERED_CHECKS:
+        cmds.update(getattr(chk, "required_commands", ()) or ())
+    return sorted(cmds)
+
+
 # -------------------------- Generic checks ---------------------------------
 
 
@@ -923,6 +1301,7 @@ class CoolingStatusCheck(BaseCheck):
     name = "cooling_status"
     category = "environment"
     supported_platforms = ("all",)
+    required_commands = ("show system env cooling",)
 
     def run(self, ctx: TechSupportContext) -> List[CheckResult]:
         blocks = ctx.get_blocks("show system env cooling")
@@ -968,6 +1347,7 @@ class TemperatureStatusCheck(BaseCheck):
     name = "temperature_status"
     category = "environment"
     supported_platforms = ("all",)
+    required_commands = ("show system env temperature",)
 
     def run(self, ctx: TechSupportContext) -> List[CheckResult]:
         blocks = ctx.get_blocks("show system env temperature")
@@ -1012,6 +1392,7 @@ class CoreDumpCheck(BaseCheck):
     name = "core_dump_files"
     category = "system"
     supported_platforms = ("all",)
+    required_commands = ("bash ls -ltr /var/core",)
 
     def run(self, ctx: TechSupportContext) -> List[CheckResult]:
         blocks = ctx.get_blocks("bash ls -ltr /var/core")
@@ -1056,6 +1437,7 @@ class FlashUsageCheck(BaseCheck):
     name = "flash_usage"
     category = "storage"
     supported_platforms = ("all",)
+    required_commands = ("bash df -h",)
 
     def run(self, ctx: TechSupportContext) -> List[CheckResult]:
         blocks = ctx.get_blocks("bash df -h")
@@ -1112,6 +1494,7 @@ class ExtensionsDetailCheck(BaseCheck):
     name = "extensions_detail"
     category = "software"
     supported_platforms = ("all",)
+    required_commands = ("show extensions detail",)
 
     def run(self, ctx: TechSupportContext) -> List[CheckResult]:
         blocks = ctx.get_blocks("show extensions detail")
@@ -1186,6 +1569,7 @@ class CpuUsageCheck(BaseCheck):
     name = "cpu_usage_top"
     category = "process"
     supported_platforms = ("all",)
+    required_commands = ("show processes top once",)
 
     def run(self, ctx: TechSupportContext) -> List[CheckResult]:
         blocks = ctx.get_blocks("show processes top once")
@@ -1269,6 +1653,7 @@ class MemoryUsageCheck(BaseCheck):
     name = "memory_usage_top"
     category = "process"
     supported_platforms = ("all",)
+    required_commands = ("show processes top memory once",)
 
     def run(self, ctx: TechSupportContext) -> List[CheckResult]:
         blocks = ctx.get_blocks("show processes top memory once")
@@ -1377,6 +1762,7 @@ class ModuleUptimeCheck(BaseCheck):
     name = "module_uptime"
     category = "hardware"
     supported_platforms = ("78xx", "75xx", "7368", "7289", "7388")
+    required_commands = ("show module",)
 
     def run(self, ctx: TechSupportContext) -> List[CheckResult]:
         blocks = ctx.get_blocks("show module")
@@ -1495,6 +1881,7 @@ class SandHealthCheck(BaseCheck):
     name = "platform_sand_health"
     category = "hardware"
     supported_platforms = ("78xx", "75xx")
+    required_commands = ("show platform sand health",)
 
     def run(self, ctx: TechSupportContext) -> List[CheckResult]:
         blocks = ctx.get_blocks("show platform sand health")
@@ -1534,6 +1921,7 @@ class FapFabricSerdesCheck(BaseCheck):
     name = "fap_fabric_serdes"
     category = "hardware"
     supported_platforms = ("78xx", "75xx")
+    required_commands = ("show platform fap fabric detail",)
 
     PATTERN_78XX = re.compile(
         r"(U--- Ramon|[|]---U Ramon|I---I? Ramon|[|]---I Ramon|[|]--- Ramon|---[|] Ramon)"
@@ -1595,6 +1983,7 @@ class PlatformFapCountersNzCheck(BaseCheck):
     name = "platform_fap_counters_nz"
     category = "hardware"
     supported_platforms = ("78xx", "75xx")
+    required_commands = ("show platform fap counters",)
 
     CMD_PREFIX = "show platform fap counters"
     CNTR_75_RE = re.compile(
@@ -1878,6 +2267,7 @@ class RedundancyStatusCheck(BaseCheck):
     name = "redundancy_status"
     category = "system"
     supported_platforms = ("78xx", "75xx")
+    required_commands = ("show redundancy status",)
 
     def run(self, ctx: TechSupportContext) -> List[CheckResult]:
         blocks = ctx.get_blocks("show redundancy status")
@@ -2007,6 +2397,7 @@ class PciErrorCheck(BaseCheck):
     name = "pci_errors"
     category = "hardware"
     supported_platforms = ("all",)
+    required_commands = ("show pci",)
 
     def run(self, ctx: TechSupportContext) -> List[CheckResult]:
         blocks = ctx.get_blocks("show pci")
@@ -2096,6 +2487,7 @@ class AgentCrashLogCheck(BaseCheck):
     name = "agent_logs_crash"
     category = "software"
     supported_platforms = ("all",)
+    required_commands = ("show agent logs crash",)
 
     def run(self, ctx: TechSupportContext) -> List[CheckResult]:
         blocks = ctx.get_blocks("show agent logs crash")
@@ -2141,6 +2533,7 @@ class PowerInputCheck(BaseCheck):
     name = "power_input_voltage"
     category = "environment"
     supported_platforms = ("all",)
+    required_commands = ("show system environment power detail",)
 
     def run(self, ctx: TechSupportContext) -> List[CheckResult]:
         blocks = ctx.get_blocks("show system environment power detail")
@@ -2202,6 +2595,7 @@ class LoggingThresholdErrorsCheck(BaseCheck):
     name = "logging_threshold_errors"
     category = "hardware"
     supported_platforms = ("all",)
+    required_commands = ("show logging threshold errors",)
     
     # Use shared patterns list
     ERROR_PATTERNS = LOGGING_THRESHOLD_ERROR_PATTERNS
@@ -2382,6 +2776,7 @@ class InterfaceQueueDropsCheck(BaseCheck):
     name = "interfaces_queue_drops"
     category = "interface"
     supported_platforms = ("all",)
+    required_commands = ("show interfaces counters queue drops",)
 
     def run(self, ctx: TechSupportContext) -> List[CheckResult]:
         blocks = ctx.get_blocks("show interfaces counters queue drops")
@@ -2430,6 +2825,7 @@ class CpuQueueDropsCheck(BaseCheck):
     name = "cpu_queue_drops"
     category = "system"
     supported_platforms = ("all",)
+    required_commands = ("show cpu counters queue",)
 
     def run(self, ctx: TechSupportContext) -> List[CheckResult]:
         blocks = ctx.get_blocks("show cpu counters queue")
@@ -2562,6 +2958,7 @@ class InterfaceDiscardsCheck(BaseCheck):
     name = "interfaces_discards"
     category = "interface"
     supported_platforms = ("all",)
+    required_commands = ("show interfaces counters discards",)
 
     def run(self, ctx: TechSupportContext) -> List[CheckResult]:
         blocks = ctx.get_blocks("show interfaces counters discards")
@@ -2673,6 +3070,7 @@ class InterfaceErrorsCheck(BaseCheck):
     name = "interfaces_errors"
     category = "interface"
     supported_platforms = ("all",)
+    required_commands = ("show interfaces counters errors",)
 
     def run(self, ctx: TechSupportContext) -> List[CheckResult]:
         blocks = ctx.get_blocks("show interfaces counters errors")
@@ -2780,6 +3178,7 @@ class InterfaceErrdisabledCheck(BaseCheck):
     name = "interfaces_errdisabled"
     category = "interface"
     supported_platforms = ("all",)
+    required_commands = ("show interfaces status errdisabled",)
 
     def run(self, ctx: TechSupportContext) -> List[CheckResult]:
         blocks = ctx.get_blocks("show interfaces status errdisabled")
@@ -2863,6 +3262,7 @@ class HardwareCounterDropCheck(BaseCheck):
     name = "hardware_counter_drop"
     category = "hardware"
     supported_platforms = ("78xx", "75xx", "7289", "7388")
+    required_commands = ("show hardware counter drop",)
 
     SUMMARY_A_RE = re.compile(
         r"Total\s+Adverse\s*\(A\)\s*Drops:\s*(\d+)", re.IGNORECASE
@@ -3058,6 +3458,7 @@ class HardwareCapacityCheck(BaseCheck):
     name = "hardware_capacity"
     category = "hardware"
     supported_platforms = ("all",)
+    required_commands = ("show hardware capacity",)
 
     def run(self, ctx: TechSupportContext) -> List[CheckResult]:
         blocks = ctx.get_blocks("show hardware capacity")
@@ -3109,6 +3510,7 @@ class SystemHealthStorageCheck(BaseCheck):
     name = "system_health_storage"
     category = "storage"
     supported_platforms = ("all",)
+    required_commands = ("show system health storage",)
 
     def run(self, ctx: TechSupportContext) -> List[CheckResult]:
         blocks = ctx.get_blocks("show system health storage")
@@ -3256,6 +3658,7 @@ class HardwareFpgaErrorCheck(BaseCheck):
     name = "hardware_fpga_error"
     category = "hardware"
     supported_platforms = ("all",)
+    required_commands = ("show hardware fpga error",)
 
     def run(self, ctx: TechSupportContext) -> List[CheckResult]:
         blocks = ctx.get_blocks("show hardware fpga error")
@@ -3416,6 +3819,7 @@ class ScdSatelliteRetryErrCheck(BaseCheck):
     name = "scd_satellite_retry_error"
     category = "hardware"
     supported_platforms = ("7368", "7289", "7388")
+    required_commands = ("show platform scd satellite debug",)
 
     def run(self, ctx: TechSupportContext) -> List[CheckResult]:
         blocks = ctx.get_blocks("show platform scd satellite debug")
@@ -3488,6 +3892,7 @@ class RunningConfigCheck(BaseCheck):
     name = "running_config_check"
     category = "config"
     supported_platforms = ("all",)  # Support all platforms, but check patterns based on detected platform
+    required_commands = ("show running-config sanitized",)
 
     def run(self, ctx: TechSupportContext) -> List[CheckResult]:
         blocks = ctx.get_blocks("show running-config sanitized")
@@ -3558,6 +3963,7 @@ class InventoryCheck(BaseCheck):
     name = "inventory"
     category = "hardware"
     supported_platforms = ("all",)
+    required_commands = ("show inventory",)
 
     def run(self, ctx: TechSupportContext) -> List[CheckResult]:
         blocks = ctx.get_blocks("show inventory")
@@ -4638,19 +5044,41 @@ class ProcessingTask:
     lazy_path: Optional[Path] = None  # For plain files or directories
     lazy_archive_path: Optional[Path] = None  # For archive members
     lazy_archive_spec: Optional[ArchiveShowTechMember] = None  # For archive members
+    # Live-collection fields
+    live_creds: Optional["DeviceCredentials"] = None
+    live_commands: Optional[List[str]] = None
+    live_use_tech_support: bool = False
+    live_save_dir: Optional[Path] = None
 
 
 def load_task_text(task: ProcessingTask) -> str:
-    """Load show-tech text for a task (pre-loaded, plain file, or archive member)."""
+    """Load show-tech text for a task (pre-loaded, plain file, archive member, or live device)."""
     if task.text is not None:
         return task.text
     if task.lazy_path is not None:
         return _read_path_maybe_gunzip(task.lazy_path)
     if task.lazy_archive_path is not None and task.lazy_archive_spec is not None:
         return read_text_from_archive_member(task.lazy_archive_path, task.lazy_archive_spec)
+    if task.live_creds is not None:
+        cmds = task.live_commands or collect_required_commands()
+        text = fetch_device_output(
+            task.live_creds, cmds, use_tech_support=task.live_use_tech_support
+        )
+        if task.live_save_dir is not None:
+            _save_live_collection(task.live_save_dir, task.live_creds.host, text)
+        return text
     raise ValueError(
         f"Cannot load text for task {task.source_id}: missing lazy-load fields"
     )
+
+
+def _save_live_collection(directory: Path, host: str, text: str) -> None:
+    directory.mkdir(parents=True, exist_ok=True)
+    stamp = _dt.datetime.now().strftime("%Y%m%d-%H%M%S")
+    safe_host = re.sub(r"[^A-Za-z0-9_.\-]+", "_", host) or "device"
+    target = directory / f"{safe_host}-show-tech-{stamp}.txt"
+    target.write_text(text, encoding="utf-8")
+    LOG.info("Saved live collection to %s", target)
 
 
 def _match_command_blocks(blocks: List[CommandBlock], needle: str) -> List[CommandBlock]:
@@ -5564,17 +5992,10 @@ def process_single_task(task: ProcessingTask) -> Tuple[str, str]:
     """
     text = task.text
     try:
-        # Lazy-load text if needed
+        # Lazy-load text if needed (file, archive, or live device collection)
         if text is None:
-            if task.lazy_path is not None:
-                # Load from plain file
-                text = _read_path_maybe_gunzip(task.lazy_path)
-            elif task.lazy_archive_path is not None and task.lazy_archive_spec is not None:
-                # Load from archive member
-                text = read_text_from_archive_member(task.lazy_archive_path, task.lazy_archive_spec)
-            else:
-                raise ValueError(f"Cannot lazy-load text for task {task.source_id}: missing lazy-load fields")
-        
+            text = load_task_text(task)
+
         report = process_showtech_text(
             task.source_id,
             text,
@@ -5594,6 +6015,103 @@ def process_single_task(task: ProcessingTask) -> Tuple[str, str]:
         # Release text reference immediately after processing (if lazy-loaded)
         if text is not None and task.text is None:
             del text
+
+
+def _load_inventory_file(path: Path) -> List[Dict[str, object]]:
+    """Parse a device inventory file. Tries JSON first, then YAML.
+
+    Returns a list of dicts: [{host, user?, password?, port?, transport?, ...}].
+    """
+    text = path.read_text(encoding="utf-8")
+    import json as _json
+    try:
+        data = _json.loads(text)
+    except Exception:
+        try:
+            import yaml  # type: ignore
+        except ImportError as exc:
+            raise ValueError(
+                f"Inventory {path} is not valid JSON and PyYAML is not installed; "
+                f"install pyyaml or convert to JSON"
+            ) from exc
+        data = yaml.safe_load(text)
+    if isinstance(data, dict) and "devices" in data:
+        data = data["devices"]
+    if not isinstance(data, list):
+        raise ValueError(f"Inventory {path} must be a list (or {{devices: [...]}})")
+    return data  # type: ignore[return-value]
+
+
+def _resolve_password(args: argparse.Namespace, host: str, inventory_pw: Optional[str]) -> str:
+    """Apply password precedence: CLI > env EOS_PASSWORD > inventory > getpass."""
+    if args.password:
+        return args.password
+    env_pw = os.environ.get("EOS_PASSWORD")
+    if env_pw:
+        return env_pw
+    if inventory_pw:
+        return inventory_pw
+    import getpass
+    return getpass.getpass(f"Password for {args.user or 'admin'}@{host}: ")
+
+
+def collect_live_tasks(args: argparse.Namespace) -> List[ProcessingTask]:
+    """Build ProcessingTasks for live device collection from CLI args + inventory."""
+    entries: List[Dict[str, object]] = []
+    if args.inventory:
+        entries.extend(_load_inventory_file(Path(args.inventory)))
+    for host in args.paths or []:
+        entries.append({"host": host})
+
+    if not entries:
+        return []
+
+    save_dir = Path(args.save) if args.save else None
+    commands = collect_required_commands()
+
+    tasks: List[ProcessingTask] = []
+    for entry in entries:
+        host = str(entry.get("host", "")).strip()
+        if not host:
+            LOG.warning("Inventory entry missing 'host', skipping: %r", entry)
+            continue
+        user = str(entry.get("user") or args.user or "admin")
+        inv_pw = entry.get("password")
+        inv_pw_str = str(inv_pw) if inv_pw is not None else None
+        password = _resolve_password(args, host, inv_pw_str)
+        port_val = entry.get("port") if entry.get("port") is not None else args.port
+        try:
+            port = int(port_val) if port_val is not None else None
+        except (TypeError, ValueError):
+            port = None
+        transport = str(entry.get("transport") or args.transport)
+        use_https = not args.http
+        verify_tls = not args.insecure
+
+        creds = DeviceCredentials(
+            host=host,
+            user=user,
+            password=password,
+            port=port,
+            transport=transport,
+            use_https=use_https,
+            verify_tls=verify_tls,
+        )
+        tasks.append(ProcessingTask(
+            source_id=f"live://{host}",
+            text=None,
+            mode=args.mode,
+            as_json=args.json,
+            debug=args.debug,
+            show_checks_in_brief=args.show_checks_in_brief,
+            skip_checks=args.skip_checks,
+            skip_categories=args.skip_categories,
+            live_creds=creds,
+            live_commands=commands,
+            live_use_tech_support=args.use_tech_support,
+            live_save_dir=save_dir,
+        ))
+    return tasks
 
 
 def collect_processing_tasks(
@@ -5779,23 +6297,28 @@ def main(argv: Optional[Sequence[str]] = None) -> None:
         return
 
     # Validate that paths are provided when not using --list-checks
-    if not args.paths:
+    if not args.paths and not getattr(args, "live", False) and not getattr(args, "inventory", None):
         print("error: the following arguments are required: PATH (unless using --list-checks)", file=sys.stderr)
         sys.exit(2)
 
-    # Collect all processing tasks
-    LOG.info("Collecting processing tasks from %d path(s)...", len(args.paths))
     low_memory = getattr(args, 'low_memory', False)
-    tasks = collect_processing_tasks(
-        args.paths,
-        args.mode,
-        args.json,
-        args.debug,
-        args.show_checks_in_brief,
-        args.skip_checks,
-        args.skip_categories,
-        low_memory=low_memory,
-    )
+    if getattr(args, "live", False) or getattr(args, "inventory", None):
+        LOG.info("Live mode: collecting tasks for %d device(s)...",
+                 len(args.paths or []) + (1 if args.inventory else 0))
+        tasks = collect_live_tasks(args)
+    else:
+        # Collect all processing tasks
+        LOG.info("Collecting processing tasks from %d path(s)...", len(args.paths))
+        tasks = collect_processing_tasks(
+            args.paths,
+            args.mode,
+            args.json,
+            args.debug,
+            args.show_checks_in_brief,
+            args.skip_checks,
+            args.skip_categories,
+            low_memory=low_memory,
+        )
     
     if not tasks:
         # For -L / -r / --cli extraction modes, returning success is misleading.

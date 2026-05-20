@@ -3,9 +3,8 @@
 A comprehensive health check tool for analyzing Arista EOS device show-tech files and support-bundle diagnostic archives.
 
 **Author**: chris.li@arista.com  
-**Company**: Arista Networks  
-**Version**: 1.3.1  
-**Last Modified**: 2026-04-20
+**Version**: 1.4.0  
+**Last Modified**: 2026-05-20
 
 ## Description
 
@@ -55,7 +54,9 @@ This tool analyzes Arista EOS show-tech / show-tech-support-all outputs and rela
 ## Requirements
 
 - Python 3.6 or higher
-- Standard library only (no external dependencies)
+- Standard library only for offline mode and `--live` over eAPI
+- Optional: `paramiko` for `--live` SSH fallback (`pip install paramiko`)
+- Optional: `pyyaml` for YAML-format `--inventory` files (JSON inventories work without it)
 
 ## Installation
 
@@ -234,6 +235,78 @@ python3 health_check_eos.py -t 8 archive1.zip archive2.zip archive3.zip
 # Interactive show-tech CLI (first matching show-tech only if several are found)
 python3 health_check_eos.py --cli /path/to/show-tech
 ```
+
+### Live mode (`--live`)
+
+Connect directly to one or more EOS devices via eAPI (HTTPS/JSON-RPC) — and
+optionally fall back to SSH — to collect just the commands each check needs,
+then run the same health checks you would run offline against a show-tech file.
+No `show tech-support` round-trip required.
+
+```bash
+# Single device (eAPI over HTTPS, self-signed cert OK)
+python3 health_check_eos.py --live 10.0.0.1 -u admin --insecure
+
+# Password via env var to keep it out of shell history
+EOS_PASSWORD=*** python3 health_check_eos.py --live 10.0.0.1 -u admin --insecure
+
+# Batch from an inventory file, 8 devices in parallel, verbose to a file
+python3 health_check_eos.py --live --inventory hosts.yaml -t 8 -V -o report.txt
+
+# Force SSH (paramiko required) when eAPI is disabled
+python3 health_check_eos.py --live 10.0.0.1 -u admin --transport ssh
+
+# Have the device run `show tech-support all` and analyze that instead
+python3 health_check_eos.py --live 10.0.0.1 -u admin -T --insecure
+
+# Collect from device and also drop a show-tech-style file for offline re-check
+python3 health_check_eos.py --live 10.0.0.1 -u admin --insecure --save ./collected/
+python3 health_check_eos.py ./collected/10.0.0.1-show-tech-*.txt
+```
+
+#### Inventory file
+
+Either JSON or YAML; each entry needs at least `host`. Per-entry fields override
+the matching CLI flags:
+
+```yaml
+# hosts.yaml
+- host: spine1.lab
+  user: admin
+- host: spine2.lab
+  user: netops
+  password: hunter2
+  transport: eapi
+- host: leaf1.lab
+  transport: ssh
+  port: 22
+```
+
+#### Enabling eAPI on the device
+
+```
+configure
+management api http-commands
+   no shutdown
+```
+
+#### Live-mode options
+
+| Option | Meaning |
+|---|---|
+| `--live` | Treat `PATH` arguments as hostnames/IPs |
+| `--inventory FILE` | JSON or YAML device list (combines with `PATH` hosts) |
+| `-u / --user` | Default username |
+| `--password` | Default password (precedence: CLI > `EOS_PASSWORD` env > inventory > getpass) |
+| `--port N` | eAPI port (default 443 / 80 with `--http`); SSH always uses 22 |
+| `--http` | eAPI over plain HTTP |
+| `--insecure` | Skip TLS verification (self-signed certs) |
+| `--transport {auto,eapi,ssh}` | Default `auto` tries eAPI then SSH |
+| `-T / --use-tech-support` | Run `show tech-support all` on the device instead of the per-check command set |
+| `--save DIR` | Also write the collected output to `DIR/<host>-show-tech-<ts>.txt` |
+
+`-t / --threads`, `-o / --output`, `-V / -v / -w / -j`, `-s / -S / -c` all work
+the same as in offline mode and apply across all live devices.
 
 ## Health Checks
 
@@ -419,10 +492,6 @@ Use `-c` or `--show-checks-in-brief` to view full output of specific checks in b
 - Command blocks in show-tech files are identified by `---` delimiters (e.g., `------------- show—cmd -------------`)
 - Some checks are platform-specific and will return INFO if the platform doesn't match
 - The tool supports nested archives (archives containing other archives)
-
-## License
-
-Copyright (c) 2026 Arista Networks, Inc. All rights reserved.
 
 ## Support
 
