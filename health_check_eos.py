@@ -2052,12 +2052,14 @@ class FapFabricSerdesCheck(BaseCheck):
     supported_platforms = ("78xx", "75xx")
     required_commands = ("show platform fap fabric detail",)
 
-    PATTERN_78XX = re.compile(
-        r"(U--- Ramon|[|]---U Ramon|I---I? Ramon|[|]---I Ramon|[|]--- Ramon|---[|] Ramon)"
-    )
-    PATTERN_OTHER = re.compile(
-        r"(U--- Fe|[|]---U Fe|I---I? Fe|[|]---I Fe|[|]--- Fe|---[|] Fe)"
-    )
+    # SerDes link state encoding in "X---Y" (X=local, Y=peer):
+    #   < local up, > peer up, | down, U unreachable, I isolated, S shutdown, ? unknown.
+    # Healthy: <--->. Ignored: any side equal to | (down may just mean no remote device).
+    # Abnormal: either side in {U, I, S, ?} AND neither side is |.
+    # Suffix "Ramon"/"Fe" restricts to the chip-info row so the 4 trailing counter
+    # rows per SerDes are skipped.
+    PATTERN_78XX = re.compile(r"(?:[UIS?]---[^| ]|[^| ]---[UIS?]) Ramon")
+    PATTERN_OTHER = re.compile(r"(?:[UIS?]---[^| ]|[^| ]---[UIS?]) Fe")
 
     def run(self, ctx: TechSupportContext) -> List[CheckResult]:
         blocks = ctx.get_blocks("show platform fap fabric detail")
@@ -4392,9 +4394,9 @@ def format_human_report(
             # Reuse the same filtering intent as debug mode.
             if r.name == "fap_fabric_serdes":
                 if ctx.platform_series == "78xx":
-                    pattern = r"(U--- Ramon|[|]---U Ramon|I---I? Ramon|[|]---I Ramon|[|]--- Ramon|---[|] Ramon)"
+                    pattern = r"(?:[UIS?]---[^| ]|[^| ]---[UIS?]) Ramon"
                 else:
-                    pattern = r"(U--- Fe|[|]---U Fe|I---I? Fe|[|]---I Fe|[|]--- Fe|---[|] Fe)"
+                    pattern = r"(?:[UIS?]---[^| ]|[^| ]---[UIS?]) Fe"
                 return [ln for ln in raw_lines if re.search(pattern, ln)] or [
                     "(No lines matched the pattern)"
                 ]
@@ -4747,13 +4749,9 @@ def format_human_report(
                         # Special case: output only lines matching the regex pattern
                         text = "\n".join(raw_lines)
                         if ctx.platform_series == "78xx":
-                            # Pattern: U--- Ramon|---U Ramon|I--- Ramon|I---I Ramon|---I Ramon|\|--- Ramon|---\| Ramon
-                            # Note: I---I Ramon is also a valid pattern (I---I followed by Ramon without space)
-                            pattern = r"(U--- Ramon|[|]---U Ramon|I---I? Ramon|[|]---I Ramon|[|]--- Ramon|---[|] Ramon)"
+                            pattern = r"(?:[UIS?]---[^| ]|[^| ]---[UIS?]) Ramon"
                         else:
-                            # Pattern: U--- Fe|---U Fe|I--- Fe|I---I Fe|---I Fe|\|--- Fe|---\| Fe
-                            # Note: I---I Fe is also a valid pattern (I---I followed by Fe without space)
-                            pattern = r"(U--- Fe|[|]---U Fe|I---I? Fe|[|]---I Fe|[|]--- Fe|---[|] Fe)"
+                            pattern = r"(?:[UIS?]---[^| ]|[^| ]---[UIS?]) Fe"
                         
                         # Find matching lines (all lines in debug mode, no limit)
                         matching_lines = []
