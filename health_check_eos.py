@@ -33,8 +33,8 @@ from enum import Enum
 from typing import Callable, Dict, Iterable, List, Optional, Sequence, Tuple
 
 __author__ = "chris.li@arista.com"
-__last_modified__ = "2026-05-20"
-__version__ = "1.4.2"
+__last_modified__ = "2026-05-23"
+__version__ = "1.4.3"
 
 
 LOG = logging.getLogger("health_check_eos")
