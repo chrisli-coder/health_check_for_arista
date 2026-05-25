@@ -34,7 +34,7 @@ from typing import Callable, Dict, Iterable, List, Optional, Sequence, Tuple
 
 __author__ = "chris.li@arista.com"
 __last_modified__ = "2026-05-23"
-__version__ = "1.4.6"
+__version__ = "1.4.7"
 
 
 LOG = logging.getLogger("health_check_eos")
@@ -4576,6 +4576,10 @@ def format_human_report(
                 ]
 
             if r.name == "platform_fap_counters_nz":
+                # Prefer per-check trigger details when populated (WARN case) so the
+                # displayed rows match what the summary actually called out.
+                if r.details:
+                    return list(r.details)
                 idxs = PlatformFapCountersNzCheck._filtered_row_indices(
                     raw_lines, ctx.platform_series, ctx.live
                 )
@@ -4893,12 +4897,17 @@ def format_human_report(
                     raw_lines = blocks[0].lines
                     lines.append("")
                     if r.name == "platform_fap_counters_nz":
-                        idxs = PlatformFapCountersNzCheck._filtered_row_indices(
-                            raw_lines, ctx.platform_series, ctx.live
-                        )
-                        matching_lines = PlatformFapCountersNzCheck._enriched_counter_rows(
-                            raw_lines, idxs
-                        )
+                        # Prefer per-check trigger details when populated so debug
+                        # output matches the summary's named FAPs.
+                        if r.details:
+                            matching_lines = list(r.details)
+                        else:
+                            idxs = PlatformFapCountersNzCheck._filtered_row_indices(
+                                raw_lines, ctx.platform_series, ctx.live
+                            )
+                            matching_lines = PlatformFapCountersNzCheck._enriched_counter_rows(
+                                raw_lines, idxs
+                            )
                         lines.append(f"[DEBUG filtered {cmd}]")
                         lines.append("-" * 80)
                         if matching_lines:
