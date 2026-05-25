@@ -3,8 +3,8 @@
 A comprehensive health check tool for analyzing Arista EOS device show-tech files and support-bundle diagnostic archives.
 
 **Author**: chris.li@arista.com  
-**Version**: 1.4.3  
-**Last Modified**: 2026-05-23
+**Version**: 1.4.4  
+**Last Modified**: 2026-05-25
 
 ## Description
 

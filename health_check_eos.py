@@ -34,7 +34,7 @@ from typing import Callable, Dict, Iterable, List, Optional, Sequence, Tuple
 
 __author__ = "chris.li@arista.com"
 __last_modified__ = "2026-05-23"
-__version__ = "1.4.3"
+__version__ = "1.4.4"
 
 
 LOG = logging.getLogger("health_check_eos")
@@ -462,11 +462,21 @@ class TechSupportParser:
 class TechSupportContext:
     """Holds parsed command outputs and basic device information."""
 
-    def __init__(self, source_id: str, blocks: Sequence[CommandBlock]) -> None:
+    def __init__(
+        self,
+        source_id: str,
+        blocks: Sequence[CommandBlock],
+        live: bool = False,
+    ) -> None:
         self.source_id = source_id
         self._blocks_by_cmd: Dict[str, List[CommandBlock]] = {}
         for blk in blocks:
             self._blocks_by_cmd.setdefault(blk.command, []).append(blk)
+
+        # True when this context is fed by --live device collection (as opposed to
+        # an offline show-tech file). Checks that need point-in-time vs. historical
+        # semantics can branch on this.
+        self.live: bool = live
 
         # Basic info populated by dedicated parser based on show version/clock etc.
         self.hostname: Optional[str] = None
@@ -2122,9 +2132,15 @@ class PlatformFapCountersNzCheck(BaseCheck):
         re.IGNORECASE,
     )
     CNTR_78_RE = re.compile(r"Voq\s+Latency\s+Rjct", re.IGNORECASE)
+    DRAM_RE = re.compile(r"^\s*Dram\s+Bdbs\s+Free\s+Status\s*:", re.IGNORECASE)
+    DRAM_MIN_RE = re.compile(r"^\s*Dram\s+Bdbs\s+Free\s+Min\s+Status\s*:", re.IGNORECASE)
+    AQC_RE = re.compile(r"^\s*ActiveQueueCount\s*:")
+    DRAM_THRESHOLD = 5000
+    AQC_THRESHOLD = 100
     DATE_RE = re.compile(r"(\d{4}-\d{2}-\d{2}\s+\d{2}:\d{2}:\d{2})")
     _CHIP_SECTION_RE = re.compile(r"^(\S+/\d+)\s+Counters\b")
     _CGM_BRACKET_RE = re.compile(r"^(\[[^\]]+\])\s*$")
+    _SEV_ORDER = {Severity.OK: 0, Severity.INFO: 1, Severity.WARN: 2, Severity.ERROR: 3}
 
     @staticmethod
     def _is_separator_dash_line(raw: str) -> bool:
@@ -2229,6 +2245,241 @@ class PlatformFapCountersNzCheck(BaseCheck):
             return dates[0]
         return dates[1]
 
+    @staticmethod
+    def _parse_value(line: str) -> Optional[int]:
+        parts = line.split(":")
+        if len(parts) < 2:
+            return None
+        try:
+            return int(parts[1].strip())
+        except ValueError:
+            return None
+
+    @classmethod
+    def _dram_aqc_row_indices(cls, lines: Sequence[str]) -> List[int]:
+        return [
+            i for i, ln in enumerate(lines)
+            if cls.DRAM_RE.search(ln) or cls.DRAM_MIN_RE.search(ln) or cls.AQC_RE.search(ln)
+        ]
+
+    @classmethod
+    def _filtered_row_indices(
+        cls,
+        lines: Sequence[str],
+        platform_series: Optional[str],
+        live: bool = False,
+    ) -> List[int]:
+        is_75 = platform_series == "75xx"
+        plat_re = cls.CNTR_75_RE if is_75 else cls.CNTR_78_RE
+        dram_re = cls.DRAM_RE if live else cls.DRAM_MIN_RE
+        out: List[int] = []
+        for i, ln in enumerate(lines):
+            if plat_re.search(ln):
+                out.append(i)
+            elif not is_75 and (dram_re.search(ln) or cls.AQC_RE.search(ln)):
+                out.append(i)
+        return out
+
+    @staticmethod
+    def _parse_show_clock_date(ctx: TechSupportContext) -> Optional[_dt.date]:
+        if not ctx.system_time:
+            return None
+        try:
+            return _dt.datetime.strptime(
+                ctx.system_time.strip(), "%a %b %d %H:%M:%S %Y"
+            ).date()
+        except (ValueError, TypeError) as exc:
+            LOG.debug("platform_fap_counters_nz: show clock parse failed: %s", exc)
+            return None
+
+    def _eval_75xx_reassembly(
+        self,
+        lines: Sequence[str],
+        date_clock: Optional[_dt.date],
+        ctx: TechSupportContext,
+    ) -> Dict[str, object]:
+        matched_idx = [(i, ln) for i, ln in enumerate(lines) if self.CNTR_75_RE.search(ln)]
+        if not matched_idx:
+            return {
+                "severity": Severity.OK,
+                "summary": (
+                    "Cgm Unicast Data Buffer Drop Reassembly Cnt not present in "
+                    "non-zero FAP counters."
+                ),
+                "idxs": [],
+            }
+        sample_idx = [i for i, _ in matched_idx[:10]]
+        if not ctx.system_time:
+            return {
+                "severity": Severity.INFO,
+                "summary": (
+                    "Cgm Unicast Data Buffer Drop Reassembly Cnt row present but "
+                    "system time unavailable; cannot compare last update date."
+                ),
+                "idxs": sample_idx,
+            }
+        if date_clock is None:
+            return {
+                "severity": Severity.INFO,
+                "summary": (
+                    "Cgm Unicast Data Buffer Drop Reassembly Cnt row present but "
+                    "show clock could not be parsed; cannot compare last update date."
+                ),
+                "idxs": sample_idx,
+            }
+        warn_indices: List[int] = []
+        for i, ln in matched_idx:
+            last_ts = self._last_update_ts_75xx_line(ln)
+            if not last_ts:
+                continue
+            try:
+                dt_last = _dt.datetime.strptime(last_ts, "%Y-%m-%d %H:%M:%S")
+            except (ValueError, TypeError):
+                continue
+            if dt_last.date() == date_clock:
+                if i not in warn_indices:
+                    warn_indices.append(i)
+                if len(warn_indices) >= 10:
+                    break
+        if warn_indices:
+            return {
+                "severity": Severity.WARN,
+                "summary": (
+                    "Last update date for Cgm Unicast Data Buffer Drop Reassembly Cnt "
+                    "matches device date (show clock)."
+                ),
+                "idxs": warn_indices,
+            }
+        if not any(self._last_update_ts_75xx_line(ln) for _, ln in matched_idx):
+            return {
+                "severity": Severity.INFO,
+                "summary": (
+                    "Cgm Unicast Data Buffer Drop Reassembly Cnt row present but "
+                    "no YYYY-MM-DD timestamp found on row."
+                ),
+                "idxs": sample_idx,
+            }
+        return {
+            "severity": Severity.OK,
+            "summary": (
+                "Cgm Unicast Data Buffer Drop Reassembly Cnt present; last update is "
+                "not the same calendar day as show clock."
+            ),
+            "idxs": sample_idx,
+        }
+
+    def _eval_78xx_voq(self, lines: Sequence[str]) -> Dict[str, object]:
+        matched_idx = [i for i, ln in enumerate(lines) if self.CNTR_78_RE.search(ln)]
+        if matched_idx:
+            return {
+                "severity": Severity.WARN,
+                "summary": "Voq Latency Rjct present in non-zero FAP counters.",
+                "idxs": matched_idx[:10],
+            }
+        return {
+            "severity": Severity.OK,
+            "summary": "Voq Latency Rjct not present in non-zero FAP counters.",
+            "idxs": [],
+        }
+
+    def _eval_dram_aqc(
+        self,
+        lines: Sequence[str],
+        live: bool,
+    ) -> Dict[str, object]:
+        dram_re = self.DRAM_RE if live else self.DRAM_MIN_RE
+        dram_name = "Dram Bdbs Free Status" if live else "Dram Bdbs Free Min Status"
+        window_hours = 1 if live else 24
+        window = _dt.timedelta(hours=window_hours)
+
+        per_fap: Dict[str, Dict[str, List[int]]] = {}
+        fap_order: List[str] = []
+        cur_chip: Optional[str] = None
+        for i, ln in enumerate(lines):
+            m = self._CHIP_SECTION_RE.match(ln.strip())
+            if m:
+                cur_chip = m.group(1)
+                if cur_chip not in per_fap:
+                    per_fap[cur_chip] = {"dram": [], "aqc": []}
+                    fap_order.append(cur_chip)
+                continue
+            if cur_chip is None:
+                continue
+            if dram_re.search(ln):
+                per_fap[cur_chip]["dram"].append(i)
+            elif self.AQC_RE.search(ln):
+                per_fap[cur_chip]["aqc"].append(i)
+
+        if not any(g["dram"] or g["aqc"] for g in per_fap.values()):
+            return {
+                "severity": Severity.OK,
+                "summary": (
+                    f"{dram_name} / ActiveQueueCount rows not present in "
+                    "non-zero FAP counters."
+                ),
+                "idxs": [],
+            }
+
+        def _row_dt(idx: int) -> Optional[_dt.datetime]:
+            ts = self._last_update_ts_75xx_line(lines[idx])
+            if not ts:
+                return None
+            try:
+                return _dt.datetime.strptime(ts, "%Y-%m-%d %H:%M:%S")
+            except (ValueError, TypeError):
+                return None
+
+        def _candidates(idxs: Sequence[int], predicate: Callable[[int], bool]) -> List[Tuple[int, _dt.datetime]]:
+            out: List[Tuple[int, _dt.datetime]] = []
+            for i in idxs:
+                v = self._parse_value(lines[i])
+                if v is None or not predicate(v):
+                    continue
+                t = _row_dt(i)
+                if t is None:
+                    continue
+                out.append((i, t))
+            return out
+
+        triggered: List[str] = []
+        trigger_rows: List[int] = []
+        for chip in fap_order:
+            groups = per_fap[chip]
+            dram_cands = _candidates(groups["dram"], lambda v: v < self.DRAM_THRESHOLD)
+            if not dram_cands:
+                continue
+            aqc_cands = _candidates(groups["aqc"], lambda v: v > self.AQC_THRESHOLD)
+            if not aqc_cands:
+                continue
+            hit_idxs: set = set()
+            for di, dt_ in dram_cands:
+                for ai, at_ in aqc_cands:
+                    if abs(at_ - dt_) <= window:
+                        hit_idxs.add(di)
+                        hit_idxs.add(ai)
+            if hit_idxs:
+                triggered.append(chip)
+                trigger_rows.extend(sorted(hit_idxs))
+
+        if triggered:
+            return {
+                "severity": Severity.WARN,
+                "summary": (
+                    f"FAP(s) with {dram_name} < {self.DRAM_THRESHOLD} and "
+                    f"ActiveQueueCount > {self.AQC_THRESHOLD} updated within "
+                    f"{window_hours}h: {', '.join(triggered)}."
+                ),
+                "idxs": trigger_rows,
+            }
+        return {
+            "severity": Severity.OK,
+            "summary": (
+                f"No FAP had {dram_name} < {self.DRAM_THRESHOLD} and "
+                f"ActiveQueueCount > {self.AQC_THRESHOLD} updated within {window_hours}h."
+            ),
+            "idxs": [],
+        }
+
     def run(self, ctx: TechSupportContext) -> List[CheckResult]:
         blocks = ctx.get_blocks(self.CMD_PREFIX)
         LOG.debug(
@@ -2247,147 +2498,28 @@ class PlatformFapCountersNzCheck(BaseCheck):
                 )
             ]
         lines = blocks[0].lines
+        date_clock = self._parse_show_clock_date(ctx)
 
+        parts: List[Dict[str, object]] = []
         if ctx.platform_series == "75xx":
-            matched_idx = [
-                (i, ln)
-                for i, ln in enumerate(lines)
-                if self.CNTR_75_RE.search(ln)
-            ]
-            if not matched_idx:
-                return [
-                    CheckResult(
-                        name=self.name,
-                        category=self.category,
-                        severity=Severity.OK,
-                        summary=(
-                            "Cgm Unicast Data Buffer Drop Reassembly Cnt not present in "
-                            "non-zero FAP counters."
-                        ),
-                        command=self.CMD_PREFIX,
-                    )
-                ]
-            sample_idx = [i for i, _ in matched_idx[:10]]
-            if not ctx.system_time:
-                return [
-                    CheckResult(
-                        name=self.name,
-                        category=self.category,
-                        severity=Severity.INFO,
-                        summary=(
-                            "Cgm Unicast Data Buffer Drop Reassembly Cnt row present but "
-                            "system time unavailable; cannot compare last update date."
-                        ),
-                        details=self._enriched_counter_rows(lines, sample_idx),
-                        command=self.CMD_PREFIX,
-                    )
-                ]
-            try:
-                dt_clock = _dt.datetime.strptime(
-                    ctx.system_time.strip(), "%a %b %d %H:%M:%S %Y"
-                )
-                date_clock = dt_clock.date()
-            except (ValueError, TypeError) as exc:
-                LOG.debug("platform_fap_counters_nz: show clock parse failed: %s", exc)
-                return [
-                    CheckResult(
-                        name=self.name,
-                        category=self.category,
-                        severity=Severity.INFO,
-                        summary=(
-                            "Cgm Unicast Data Buffer Drop Reassembly Cnt row present but "
-                            "show clock could not be parsed; cannot compare last update date."
-                        ),
-                        details=self._enriched_counter_rows(lines, sample_idx),
-                        command=self.CMD_PREFIX,
-                    )
-                ]
+            parts.append(self._eval_75xx_reassembly(lines, date_clock, ctx))
+        elif ctx.platform_series == "78xx":
+            parts.append(self._eval_78xx_voq(lines))
+            parts.append(self._eval_dram_aqc(lines, ctx.live))
 
-            same_day = False
-            warn_indices: List[int] = []
-            for i, ln in matched_idx:
-                last_ts = self._last_update_ts_75xx_line(ln)
-                if not last_ts:
-                    continue
-                try:
-                    dt_last = _dt.datetime.strptime(
-                        last_ts, "%Y-%m-%d %H:%M:%S"
-                    )
-                except (ValueError, TypeError):
-                    continue
-                if dt_last.date() == date_clock:
-                    same_day = True
-                    if i not in warn_indices:
-                        warn_indices.append(i)
-                    if len(warn_indices) >= 10:
-                        break
-
-            if same_day:
-                return [
-                    CheckResult(
-                        name=self.name,
-                        category=self.category,
-                        severity=Severity.WARN,
-                        summary=(
-                            "Last update date for Cgm Unicast Data Buffer Drop Reassembly Cnt "
-                            "matches device date (show clock)."
-                        ),
-                        details=self._enriched_counter_rows(lines, warn_indices),
-                        command=self.CMD_PREFIX,
-                    )
-                ]
-            if not any(self._last_update_ts_75xx_line(ln) for _, ln in matched_idx):
-                return [
-                    CheckResult(
-                        name=self.name,
-                        category=self.category,
-                        severity=Severity.INFO,
-                        summary=(
-                            "Cgm Unicast Data Buffer Drop Reassembly Cnt row present but "
-                            "no YYYY-MM-DD timestamp found on row."
-                        ),
-                        details=self._enriched_counter_rows(lines, sample_idx),
-                        command=self.CMD_PREFIX,
-                    )
-                ]
-            return [
-                CheckResult(
-                    name=self.name,
-                    category=self.category,
-                    severity=Severity.OK,
-                    summary=(
-                        "Cgm Unicast Data Buffer Drop Reassembly Cnt present; last update is "
-                        "not the same calendar day as show clock."
-                    ),
-                    details=self._enriched_counter_rows(lines, sample_idx),
-                    command=self.CMD_PREFIX,
-                )
-            ]
-
-        # 78xx
-        matched78_idx = [
-            (i, ln)
-            for i, ln in enumerate(lines)
-            if self.CNTR_78_RE.search(ln)
-        ]
-        if matched78_idx:
-            idx78 = [i for i, _ in matched78_idx[:10]]
-            return [
-                CheckResult(
-                    name=self.name,
-                    category=self.category,
-                    severity=Severity.WARN,
-                    summary="Voq Latency Rjct present in non-zero FAP counters.",
-                    details=self._enriched_counter_rows(lines, idx78),
-                    command=self.CMD_PREFIX,
-                )
-            ]
+        final_sev = max(
+            (p["severity"] for p in parts), key=lambda s: self._SEV_ORDER[s]  # type: ignore[index]
+        )
+        summary = " | ".join(str(p["summary"]) for p in parts)
+        all_idxs = sorted({i for p in parts for i in p["idxs"]})  # type: ignore[union-attr]
+        details = self._enriched_counter_rows(lines, all_idxs) if all_idxs else []
         return [
             CheckResult(
                 name=self.name,
                 category=self.category,
-                severity=Severity.OK,
-                summary="Voq Latency Rjct not present in non-zero FAP counters.",
+                severity=final_sev,
+                summary=summary,
+                details=details,
                 command=self.CMD_PREFIX,
             )
         ]
@@ -4402,15 +4534,9 @@ def format_human_report(
                 ]
 
             if r.name == "platform_fap_counters_nz":
-                if ctx.platform_series == "75xx":
-                    pat = PlatformFapCountersNzCheck.CNTR_75_RE
-                    idxs = [i for i, ln in enumerate(raw_lines) if pat.search(ln)]
-                else:
-                    idxs = [
-                        i
-                        for i, ln in enumerate(raw_lines)
-                        if PlatformFapCountersNzCheck.CNTR_78_RE.search(ln)
-                    ]
+                idxs = PlatformFapCountersNzCheck._filtered_row_indices(
+                    raw_lines, ctx.platform_series, ctx.live
+                )
                 enriched = PlatformFapCountersNzCheck._enriched_counter_rows(
                     raw_lines, idxs
                 )
@@ -4725,15 +4851,9 @@ def format_human_report(
                     raw_lines = blocks[0].lines
                     lines.append("")
                     if r.name == "platform_fap_counters_nz":
-                        if ctx.platform_series == "75xx":
-                            pat = PlatformFapCountersNzCheck.CNTR_75_RE
-                            idxs = [i for i, ln in enumerate(raw_lines) if pat.search(ln)]
-                        else:
-                            idxs = [
-                                i
-                                for i, ln in enumerate(raw_lines)
-                                if PlatformFapCountersNzCheck.CNTR_78_RE.search(ln)
-                            ]
+                        idxs = PlatformFapCountersNzCheck._filtered_row_indices(
+                            raw_lines, ctx.platform_series, ctx.live
+                        )
                         matching_lines = PlatformFapCountersNzCheck._enriched_counter_rows(
                             raw_lines, idxs
                         )
@@ -6150,6 +6270,7 @@ def process_single_task(task: ProcessingTask) -> Tuple[str, str]:
             task.show_checks_in_brief,
             task.skip_checks,
             task.skip_categories,
+            live=task.live_creds is not None,
         )
         return (task.source_id, report)
     except Exception as exc:
@@ -6417,7 +6538,7 @@ def collect_processing_tasks(
     return tasks
 
 
-def process_showtech_text(source_id: str, text: str, mode: str, as_json: bool, debug: bool = False, show_checks_in_brief: Optional[List[str]] = None, skip_checks: Optional[List[str]] = None, skip_categories: Optional[List[str]] = None) -> str:
+def process_showtech_text(source_id: str, text: str, mode: str, as_json: bool, debug: bool = False, show_checks_in_brief: Optional[List[str]] = None, skip_checks: Optional[List[str]] = None, skip_categories: Optional[List[str]] = None, live: bool = False) -> str:
     # Load into memory, parse, then drop raw text reference
     parser = TechSupportParser()
     blocks = parser.parse(text)
@@ -6425,7 +6546,7 @@ def process_showtech_text(source_id: str, text: str, mode: str, as_json: bool, d
     del parser
     text = ""  # release raw text reference
 
-    ctx = TechSupportContext(source_id, blocks)
+    ctx = TechSupportContext(source_id, blocks, live=live)
     results = run_all_checks(ctx, skip_checks, skip_categories)
     brief = make_device_brief(ctx, results)
 
