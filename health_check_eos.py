@@ -34,7 +34,7 @@ from typing import Callable, Dict, Iterable, List, Optional, Sequence, Tuple
 
 __author__ = "chris.li@arista.com"
 __last_modified__ = "2026-05-23"
-__version__ = "1.4.5"
+__version__ = "1.4.6"
 
 
 LOG = logging.getLogger("health_check_eos")
@@ -2140,6 +2140,8 @@ class PlatformFapCountersNzCheck(BaseCheck):
     DATE_RE = re.compile(r"(\d{4}-\d{2}-\d{2}\s+\d{2}:\d{2}:\d{2})")
     _CHIP_SECTION_RE = re.compile(r"^(\S+/\d+)\s+Counters\b")
     _CGM_BRACKET_RE = re.compile(r"^(\[[^\]]+\])\s*$")
+    _CGM_INDEX_RE = re.compile(r"^\[CGM(\d+)\]\s*$")
+    _IPS_INDEX_RE = re.compile(r"^\[IPS(\d+)\]\s*$")
     _SEV_ORDER = {Severity.OK: 0, Severity.INFO: 1, Severity.WARN: 2, Severity.ERROR: 3}
 
     @staticmethod
@@ -2402,23 +2404,46 @@ class PlatformFapCountersNzCheck(BaseCheck):
         def _is_dram(ln: str) -> bool:
             return any(r.search(ln) for r in dram_res)
 
-        per_fap: Dict[str, Dict[str, List[int]]] = {}
+        # Each FAP entry: dram = [(row_idx, cgm_index)], aqc = [(row_idx, ips_index)].
+        # Sub-block index is the trailing digit on [CGM<N>] / [IPS<N>] so we can
+        # require CGM<N> ↔ IPS<N> pairing within a FAP.
+        per_fap: Dict[str, Dict[str, List[Tuple[int, int]]]] = {}
         fap_order: List[str] = []
         cur_chip: Optional[str] = None
+        cur_block_kind: Optional[str] = None  # "cgm" / "ips" / None
+        cur_block_idx: Optional[int] = None
         for i, ln in enumerate(lines):
-            m = self._CHIP_SECTION_RE.match(ln.strip())
+            st = ln.strip()
+            m = self._CHIP_SECTION_RE.match(st)
             if m:
                 cur_chip = m.group(1)
                 if cur_chip not in per_fap:
                     per_fap[cur_chip] = {"dram": [], "aqc": []}
                     fap_order.append(cur_chip)
+                cur_block_kind = None
+                cur_block_idx = None
                 continue
-            if cur_chip is None:
+            cgm_m = self._CGM_INDEX_RE.match(st)
+            if cgm_m:
+                cur_block_kind = "cgm"
+                cur_block_idx = int(cgm_m.group(1))
                 continue
-            if _is_dram(ln):
-                per_fap[cur_chip]["dram"].append(i)
-            elif self.AQC_RE.search(ln):
-                per_fap[cur_chip]["aqc"].append(i)
+            ips_m = self._IPS_INDEX_RE.match(st)
+            if ips_m:
+                cur_block_kind = "ips"
+                cur_block_idx = int(ips_m.group(1))
+                continue
+            if self._CGM_BRACKET_RE.match(st):
+                # any other [BlockName] resets — counters here are out of scope
+                cur_block_kind = None
+                cur_block_idx = None
+                continue
+            if cur_chip is None or cur_block_idx is None:
+                continue
+            if cur_block_kind == "cgm" and _is_dram(ln):
+                per_fap[cur_chip]["dram"].append((i, cur_block_idx))
+            elif cur_block_kind == "ips" and self.AQC_RE.search(ln):
+                per_fap[cur_chip]["aqc"].append((i, cur_block_idx))
 
         if not any(g["dram"] or g["aqc"] for g in per_fap.values()):
             return {
@@ -2439,16 +2464,20 @@ class PlatformFapCountersNzCheck(BaseCheck):
             except (ValueError, TypeError):
                 return None
 
-        def _candidates(idxs: Sequence[int], predicate: Callable[[int], bool]) -> List[Tuple[int, _dt.datetime]]:
-            out: List[Tuple[int, _dt.datetime]] = []
-            for i in idxs:
+        def _candidates(
+            entries: Sequence[Tuple[int, int]],
+            predicate: Callable[[int], bool],
+        ) -> List[Tuple[int, int, _dt.datetime]]:
+            """Filter rows by value predicate and return (row_idx, block_idx, ts)."""
+            out: List[Tuple[int, int, _dt.datetime]] = []
+            for i, bidx in entries:
                 v = self._parse_value(lines[i])
                 if v is None or not predicate(v):
                     continue
                 t = _row_dt(i)
                 if t is None:
                     continue
-                out.append((i, t))
+                out.append((i, bidx, t))
             return out
 
         triggered: List[str] = []
@@ -2462,8 +2491,11 @@ class PlatformFapCountersNzCheck(BaseCheck):
             if not aqc_cands:
                 continue
             hit_idxs: set = set()
-            for di, dt_ in dram_cands:
-                for ai, at_ in aqc_cands:
+            for di, dbidx, dt_ in dram_cands:
+                for ai, abidx, at_ in aqc_cands:
+                    # CGM<N> must pair with IPS<N>; no cross-index matching.
+                    if dbidx != abidx:
+                        continue
                     if abs(at_ - dt_) <= window:
                         hit_idxs.add(di)
                         hit_idxs.add(ai)
