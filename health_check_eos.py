@@ -34,7 +34,7 @@ from typing import Callable, Dict, Iterable, List, Optional, Sequence, Tuple
 
 __author__ = "chris.li@arista.com"
 __last_modified__ = "2026-05-23"
-__version__ = "1.4.4"
+__version__ = "1.4.5"
 
 
 LOG = logging.getLogger("health_check_eos")
@@ -2271,12 +2271,14 @@ class PlatformFapCountersNzCheck(BaseCheck):
     ) -> List[int]:
         is_75 = platform_series == "75xx"
         plat_re = cls.CNTR_75_RE if is_75 else cls.CNTR_78_RE
-        dram_re = cls.DRAM_RE if live else cls.DRAM_MIN_RE
+        dram_res = (cls.DRAM_RE,) if live else (cls.DRAM_RE, cls.DRAM_MIN_RE)
         out: List[int] = []
         for i, ln in enumerate(lines):
             if plat_re.search(ln):
                 out.append(i)
-            elif not is_75 and (dram_re.search(ln) or cls.AQC_RE.search(ln)):
+            elif not is_75 and (
+                any(r.search(ln) for r in dram_res) or cls.AQC_RE.search(ln)
+            ):
                 out.append(i)
         return out
 
@@ -2387,10 +2389,18 @@ class PlatformFapCountersNzCheck(BaseCheck):
         lines: Sequence[str],
         live: bool,
     ) -> Dict[str, object]:
-        dram_re = self.DRAM_RE if live else self.DRAM_MIN_RE
-        dram_name = "Dram Bdbs Free Status" if live else "Dram Bdbs Free Min Status"
-        window_hours = 1 if live else 24
+        if live:
+            dram_res = (self.DRAM_RE,)
+            dram_name = "Dram Bdbs Free Status"
+            window_hours = 1
+        else:
+            dram_res = (self.DRAM_RE, self.DRAM_MIN_RE)
+            dram_name = "Dram Bdbs Free Status/Min Status"
+            window_hours = 24
         window = _dt.timedelta(hours=window_hours)
+
+        def _is_dram(ln: str) -> bool:
+            return any(r.search(ln) for r in dram_res)
 
         per_fap: Dict[str, Dict[str, List[int]]] = {}
         fap_order: List[str] = []
@@ -2405,7 +2415,7 @@ class PlatformFapCountersNzCheck(BaseCheck):
                 continue
             if cur_chip is None:
                 continue
-            if dram_re.search(ln):
+            if _is_dram(ln):
                 per_fap[cur_chip]["dram"].append(i)
             elif self.AQC_RE.search(ln):
                 per_fap[cur_chip]["aqc"].append(i)
