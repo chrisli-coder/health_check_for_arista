@@ -34,7 +34,7 @@ from typing import Callable, Dict, Iterable, List, Optional, Sequence, Tuple
 
 __author__ = "chris.li@arista.com"
 __last_modified__ = "2026-05-23"
-__version__ = "1.4.7"
+__version__ = "1.4.8"
 
 
 LOG = logging.getLogger("health_check_eos")
@@ -2271,17 +2271,34 @@ class PlatformFapCountersNzCheck(BaseCheck):
         platform_series: Optional[str],
         live: bool = False,
     ) -> List[int]:
+        # Display fallback used when the check is OK. Mirror the per-row trigger
+        # criteria so we only surface "interesting" rows — consistent with other
+        # checks (interfaces_errors, hardware_counter_drop, etc.) that show
+        # "(No matching counters)" rather than dumping zero/in-range rows.
         is_75 = platform_series == "75xx"
         plat_re = cls.CNTR_75_RE if is_75 else cls.CNTR_78_RE
         dram_res = (cls.DRAM_RE,) if live else (cls.DRAM_RE, cls.DRAM_MIN_RE)
         out: List[int] = []
         for i, ln in enumerate(lines):
             if plat_re.search(ln):
-                out.append(i)
-            elif not is_75 and (
-                any(r.search(ln) for r in dram_res) or cls.AQC_RE.search(ln)
-            ):
-                out.append(i)
+                if is_75:
+                    # 75xx semantics live in _eval_75xx_reassembly (date match);
+                    # keep presence-only fallback so we still show context if eval
+                    # returned empty for any other reason.
+                    out.append(i)
+                else:
+                    v = cls._parse_value(ln)
+                    if v is not None and v > 0:
+                        out.append(i)
+            elif not is_75:
+                if any(r.search(ln) for r in dram_res):
+                    v = cls._parse_value(ln)
+                    if v is not None and v < cls.DRAM_THRESHOLD:
+                        out.append(i)
+                elif cls.AQC_RE.search(ln):
+                    v = cls._parse_value(ln)
+                    if v is not None and v > cls.AQC_THRESHOLD:
+                        out.append(i)
         return out
 
     @staticmethod
@@ -2373,12 +2390,21 @@ class PlatformFapCountersNzCheck(BaseCheck):
         }
 
     def _eval_78xx_voq(self, lines: Sequence[str]) -> Dict[str, object]:
-        matched_idx = [i for i, ln in enumerate(lines) if self.CNTR_78_RE.search(ln)]
-        if matched_idx:
+        # Voq Latency Rjct is boolean (0/1). EOS `| nz` filters by block, so
+        # zero-valued rows ride along when a sibling counter in the same block
+        # is non-zero — parse the Value column and only flag rows with > 0.
+        triggered_idx: List[int] = []
+        for i, ln in enumerate(lines):
+            if not self.CNTR_78_RE.search(ln):
+                continue
+            v = self._parse_value(ln)
+            if v is not None and v > 0:
+                triggered_idx.append(i)
+        if triggered_idx:
             return {
                 "severity": Severity.WARN,
                 "summary": "Voq Latency Rjct present in non-zero FAP counters.",
-                "idxs": matched_idx[:10],
+                "idxs": triggered_idx[:10],
             }
         return {
             "severity": Severity.OK,
@@ -4586,7 +4612,7 @@ def format_human_report(
                 enriched = PlatformFapCountersNzCheck._enriched_counter_rows(
                     raw_lines, idxs
                 )
-                return enriched or ["(No lines matched the pattern)"]
+                return enriched or ["(No matching counters)"]
 
             if r.name == "logging_threshold_errors":
                 patterns = LOGGING_THRESHOLD_ERROR_PATTERNS
