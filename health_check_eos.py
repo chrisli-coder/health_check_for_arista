@@ -33,8 +33,8 @@ from enum import Enum
 from typing import Callable, Dict, Iterable, List, Optional, Sequence, Tuple
 
 __author__ = "chris.li@arista.com"
-__last_modified__ = "2026-05-23"
-__version__ = "1.4.8"
+__last_modified__ = "2026-05-26"
+__version__ = "1.4.9"
 
 
 LOG = logging.getLogger("health_check_eos")
@@ -171,7 +171,9 @@ def build_arg_parser() -> argparse.ArgumentParser:
         action="store_true",
         help=(
             "Interactive CLI over the first show-tech found under PATH: EOS-style abbreviated "
-            "commands, '?' for next-level keywords, paged output, '| grep' / '| include', "
+            "commands, '?' for next-level keywords, paged output, chained pipes to EOS "
+            "modifiers (`| include`/`| exclude`/`| begin`/`| section`/`| grep`) and arbitrary "
+            "Linux commands (`| wc -l`, `| sort -u`, ...), "
             "command history with arrow Up/Down on POSIX TTY; ASCII '?' ends input. "
             "Prompt uses hostname from config (running-config) when available. "
             "Does not run health checks."
@@ -5484,7 +5486,85 @@ def run_showtech_command_extract(
 # Interactive show-tech CLI (--cli)
 # ---------------------------------------------------------------------------
 
-_SHOWTECH_CLI_PIPE_RE = re.compile(r"\s*\|\s*(grep|include)\s+(.+)$", re.IGNORECASE)
+# EOS-style pipe modifiers translated into Linux equivalents at execution time.
+_EOS_PIPE_MODIFIERS: Tuple[str, ...] = ("include", "exclude", "begin", "section", "grep")
+
+
+def _pipe_positions_outside_quotes(s: str) -> List[int]:
+    """Indices of '|' characters in *s* that lie outside single/double quotes.
+
+    Backslash escapes a single following character (matches POSIX shell behavior
+    well enough for typical regex patterns the user would quote).
+    """
+    out: List[int] = []
+    in_s = in_d = False
+    esc = False
+    for i, ch in enumerate(s):
+        if esc:
+            esc = False
+            continue
+        if ch == "\\":
+            esc = True
+            continue
+        if ch == "'" and not in_d:
+            in_s = not in_s
+        elif ch == '"' and not in_s:
+            in_d = not in_d
+        elif ch == "|" and not in_s and not in_d:
+            out.append(i)
+    return out
+
+
+def _split_by_pipe_outside_quotes(s: str) -> List[str]:
+    """Split *s* on '|' outside quotes. Returns at least one segment."""
+    positions = _pipe_positions_outside_quotes(s)
+    if not positions:
+        return [s]
+    pieces: List[str] = []
+    prev = 0
+    for p in positions:
+        pieces.append(s[prev:p])
+        prev = p + 1
+    pieces.append(s[prev:])
+    return pieces
+
+
+def _find_pipe_tail_start(
+    s: str, trie: Optional["_ShowTechCommandTrie"] = None
+) -> int:
+    """Return the index in *s* where the first '|' delimiting a pipe tail begins.
+
+    Returns ``len(s)`` when there is no pipe tail (the whole string is command).
+    When *trie* is provided, the splitter prefers the longest left that still
+    resolves (or remains a valid prefix) in the trie — this keeps EOS commands
+    that literally contain '|' (e.g. ``show platform fap counters | nz``) intact
+    even when the user then adds a real pipe tail like ``| grep foo``.
+    """
+    positions = _pipe_positions_outside_quotes(s)
+    if not positions:
+        return len(s)
+    if trie is None:
+        return positions[0]
+
+    candidates = [len(s)] + sorted(positions, reverse=True)
+    longest_incomplete: Optional[int] = None
+    for end in candidates:
+        left = s[:end].strip()
+        if not left:
+            continue
+        try:
+            matched, err = trie.resolve_blocks(left.split())
+        except Exception:
+            continue
+        if matched:
+            return end
+        if err and (err.startswith("Ambiguous") or err.startswith("Unknown token")):
+            continue
+        if longest_incomplete is None:
+            longest_incomplete = end
+    if longest_incomplete is not None:
+        return longest_incomplete
+    return positions[0]
 
 @dataclass
 class _ShowTechTrieNode:
@@ -5615,13 +5695,14 @@ def _cli_expand_full_input_line(trie: Optional[_ShowTechCommandTrie], s: str) ->
     if not trie:
         return s.strip()
     s = s.rstrip("\r\n")
-    # Only treat `|` as a "pipe tail" splitter for `| grep/include ...`.
-    # For show-tech commands that literally contain `|` as a keyword (e.g. `... recent | nz`),
-    # keep it in the command token stream so abbreviation/Tab completion works naturally.
-    m_pipe = _SHOWTECH_CLI_PIPE_RE.search(s)
-    if m_pipe:
-        left = s[: m_pipe.start()].rstrip()
-        right = s[m_pipe.start() :]
+    # Locate the boundary between the EOS command (which may legitimately contain
+    # '|' tokens like `... recent | nz`) and the pipe tail of Linux/EOS-modifier
+    # commands (`| grep ...`, `| include ...`, `| wc -l`, etc.). The trie-aware
+    # splitter prefers the longest left that still resolves as a known command.
+    idx_pipe = _find_pipe_tail_start(s, trie)
+    if idx_pipe < len(s):
+        left = s[:idx_pipe].rstrip()
+        right = s[idx_pipe:]
     else:
         left, right = s, ""
 
@@ -5662,9 +5743,8 @@ def _cli_tab_complete_line(trie: _ShowTechCommandTrie, core: str) -> str:
     """
     exp = _cli_expand_full_input_line(trie, core)
     if exp != core:
-        m0 = _SHOWTECH_CLI_PIPE_RE.search(core)
-        idx0 = m0.start() if m0 else -1
-        right0 = core[idx0:] if idx0 >= 0 else ""
+        idx0 = _find_pipe_tail_start(core, trie)
+        right0 = core[idx0:] if idx0 < len(core) else ""
         if not right0.strip():
             e = exp.rstrip()
             ret = (e + " ") if e else exp
@@ -5672,9 +5752,8 @@ def _cli_tab_complete_line(trie: _ShowTechCommandTrie, core: str) -> str:
             ret = exp.strip()
         return ret
 
-    m = _SHOWTECH_CLI_PIPE_RE.search(core)
-    idx = m.start() if m else -1
-    if idx >= 0:
+    idx = _find_pipe_tail_start(core, trie)
+    if idx < len(core):
         left = core[:idx].rstrip()
         right = core[idx:]
     else:
@@ -5750,39 +5829,51 @@ def _cli_tab_complete_line(trie: _ShowTechCommandTrie, core: str) -> str:
 
 def _parse_showtech_cli_pipe(
     line: str,
-) -> Tuple[str, Optional[str], Optional[str]]:
-    """Split `... | grep ...` / `| include ...` from the rest (case-insensitive).
+    trie: Optional["_ShowTechCommandTrie"] = None,
+) -> Tuple[str, List[str]]:
+    """Split *line* into ``(cmd_part, [pipe_segment, ...])``.
 
-    Returns:
-      (cmd_part, pipe_pattern, pipe_kind) where pipe_kind is "grep" or "include".
+    Segmentation respects single/double quotes so users can write patterns like
+    ``grep "aaa|bbb"`` without the inner '|' being treated as a pipeline
+    separator. When *trie* is provided, EOS commands that literally contain
+    '|' (e.g. ``show platform fap counters | nz``) stay attached to *cmd_part*
+    even when the user appends a real pipeline tail (``... | nz | grep foo``).
     """
-    m = _SHOWTECH_CLI_PIPE_RE.search(line)
-    if not m:
-        # Normalize bare pipe tokens for command resolution so `|nz` behaves like `| nz`.
-        # Do NOT do this for `| grep/include ...` because the pattern portion may contain '|'.
-        if "|" in line:
-            normalized = re.sub(r"\s*\|\s*", " | ", line)
-            normalized = " ".join(normalized.strip().split())
-            # If user typed repeated pipes (e.g. `... | | |`), collapse them and drop trailing pipes.
-            # This avoids producing an "unknown token '|'" error while still guiding the user.
-            parts = normalized.split()
-            if "|" in parts:
-                collapsed: List[str] = []
-                for p in parts:
-                    if p == "|" and collapsed and collapsed[-1] == "|":
-                        continue
-                    collapsed.append(p)
-                while collapsed and collapsed[-1] == "|":
-                    collapsed.pop()
-                normalized2 = " ".join(collapsed)
-            else:
-                normalized2 = normalized
-            return normalized2, None, None
-        return line.strip(), None, None
-    cmd = line[: m.start()].strip()
-    kind = m.group(1).lower()
-    pat = m.group(2).strip()
-    return cmd, pat if pat else None, kind
+    idx = _find_pipe_tail_start(line, trie)
+    cmd_raw = line[:idx]
+    tail_raw = line[idx:]
+
+    # Collapse repeated bare '|' tokens inside the command portion so `|nz` and
+    # `... | | nz` both resolve. This only touches *cmd_part* — pipe-tail args
+    # (regex patterns etc.) are preserved exactly.
+    if "|" in cmd_raw:
+        cmd_norm = re.sub(r"\s*\|\s*", " | ", cmd_raw)
+        cmd_norm = " ".join(cmd_norm.strip().split())
+        parts = cmd_norm.split()
+        if "|" in parts:
+            collapsed: List[str] = []
+            for p in parts:
+                if p == "|" and collapsed and collapsed[-1] == "|":
+                    continue
+                collapsed.append(p)
+            while collapsed and collapsed[-1] == "|":
+                collapsed.pop()
+            cmd_part = " ".join(collapsed)
+        else:
+            cmd_part = cmd_norm
+    else:
+        cmd_part = cmd_raw.strip()
+
+    if not tail_raw:
+        return cmd_part, []
+
+    # Split tail by '|' outside quotes; the first segment is empty (tail starts with '|').
+    raw_segments = _split_by_pipe_outside_quotes(tail_raw)
+    segments = [seg.strip() for seg in raw_segments[1:]]
+    # Drop trailing empty segments (e.g. user pressed `... | grep foo |` mid-edit).
+    while segments and not segments[-1]:
+        segments.pop()
+    return cmd_part, segments
 
 
 def _parse_showtech_cli_help(cmd_part: str) -> Optional[Tuple[List[str], str]]:
@@ -5846,7 +5937,7 @@ def _cli_resume_line_after_help(raw: str) -> str:
     Command typed before '?' (no trailing help marker), for pre-filling the next prompt.
     Uses the section before '| grep' / '| include' only.
     """
-    cmd_part, _, _ = _parse_showtech_cli_pipe(raw.strip())
+    cmd_part, _ = _parse_showtech_cli_pipe(raw.strip())
     if "?" not in cmd_part:
         return ""
     base = cmd_part.rsplit("?", 1)[0]
@@ -5855,64 +5946,98 @@ def _cli_resume_line_after_help(raw: str) -> str:
     return trimmed
 
 
-def _showtech_cli_apply_grep(
-    lines: List[str],
-    pattern: Optional[str],
-    pipe_kind: Optional[str],
-) -> List[str]:
-    if pattern is None:
-        return lines
-    kind = (pipe_kind or "grep").lower()
+def _translate_eos_modifier_segment(seg: str) -> str:
+    """Map an EOS-style pipe modifier (``include``/``exclude``/``begin``/
+    ``section``/``grep``) to an equivalent Linux command string.
 
-    # If grep is available, delegate to it so we support real grep behavior
-    # (regex, flags like -E/-v/-w, etc.).
-    grep_cmd: List[str]
+    Non-modifier segments are returned unchanged so users can write any Linux
+    command (``wc -l``, ``sort -u | head``, ``awk '{print $1}'``...).
+    """
+    s = seg.strip()
+    if not s:
+        return s
+    parts = s.split(None, 1)
+    kw = parts[0].lower()
+    rest = parts[1].strip() if len(parts) > 1 else ""
+    if kw not in _EOS_PIPE_MODIFIERS:
+        return s
+    if not rest:
+        return "cat"
+    if kw == "grep":
+        # Default to extended regex so '|' alternation works without users having
+        # to remember `-E`/`egrep` — this matches the EOS `| include` mental model
+        # they're used to. Users can still force basic/fixed/PCRE by passing
+        # `-G`/`-F`/`-P` explicitly (grep's mode flags are last-wins).
+        return f"grep -E {rest}"
+    if kw == "include":
+        return f"grep -E {rest}"
+    if kw == "exclude":
+        return f"grep -vE {rest}"
+    # begin / section take a single pattern; pull it out via shlex so a quoted
+    # regex (``begin "Interface .*"``) is treated as one token.
     try:
-        args = shlex.split(pattern)
-        if kind == "include":
-            grep_cmd = ["grep", "-F", *args]
-        else:
-            grep_cmd = ["grep", *args]
+        pat_tokens = shlex.split(rest)
+    except ValueError:
+        pat_tokens = [rest]
+    pat = pat_tokens[0] if pat_tokens else rest
+    if kw == "begin":
+        return "sed -nE " + shlex.quote(f"/{pat}/,$p")
+    # section: from each match, print until the next blank/empty line — a
+    # reasonable approximation of EOS ``| section`` semantics for typical
+    # show-tech output where sections are separated by blank lines.
+    awk_prog = (
+        f"/{pat}/{{f=1}} "
+        f"f{{print}} "
+        f"/^[[:space:]]*$/{{f=0}}"
+    )
+    return "awk " + shlex.quote(awk_prog)
 
-        input_bytes = ("\n".join(lines) + "\n").encode("utf-8", errors="replace")
+
+def _apply_pipe_segments(
+    lines: List[str],
+    segments: List[str],
+) -> List[str]:
+    """Run *lines* through a pipeline of *segments*.
+
+    Each segment is either an EOS modifier (translated to its Linux equivalent)
+    or an arbitrary Linux command. The translated segments are joined with '|'
+    and executed in a single shell so the user can chain filters naturally,
+    e.g. ``include foo | exclude bar | wc -l`` or ``grep "aaa|bbb" | sort -u``.
+    """
+    if not segments:
+        return lines
+    translated = [_translate_eos_modifier_segment(s) for s in segments if s]
+    if not translated:
+        return lines
+    shell_cmd = " | ".join(translated)
+    input_bytes = ("\n".join(lines) + ("\n" if lines else "")).encode(
+        "utf-8", errors="replace"
+    )
+    try:
         proc = subprocess.run(
-            grep_cmd,
+            shell_cmd,
             input=input_bytes,
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
+            shell=True,
             check=False,
         )
-
-        # grep: 0 = matches, 1 = no matches, >1 = error
-        if proc.returncode == 0:
-            return proc.stdout.decode("utf-8", errors="replace").splitlines()
-        if proc.returncode == 1:
-            return []
-
-        # Error path: show grep stderr so the user can fix regex/flags.
-        err_txt = proc.stderr.decode("utf-8", errors="replace").strip()
-        if err_txt:
-            print(err_txt)
+    except Exception as exc:
+        print(f"pipe error: {exc}")
         return []
-    except FileNotFoundError:
-        # Fallback when grep binary isn't available: approximate substring match.
-        # Real grep is case-sensitive by default and only case-insensitive with `-i`.
-        pl_raw = pattern.strip()
-        parts = pl_raw.split()
-        ignore_case = False
-        while parts and parts[0] in {"-i", "--ignore-case"}:
-            ignore_case = True
-            parts.pop(0)
-        if not parts:
-            return []
-        pl = " ".join(parts)
-        if ignore_case:
-            pl = pl.lower()
-            return [ln for ln in lines if pl in ln.lower()]
-        return [ln for ln in lines if pl in ln]
-    except Exception:
-        # Never break the CLI due to grep/filtering issues.
-        return []
+    # rc 0 = success, rc 1 = "no match" (common from grep), anything else likely
+    # an actual error in user-supplied command syntax. Surface stderr either way
+    # when present so flag/regex mistakes are visible.
+    err_txt = proc.stderr.decode("utf-8", errors="replace").strip()
+    if proc.returncode not in (0, 1) and err_txt:
+        print(err_txt)
+    elif err_txt:
+        # Even on success, propagate warnings (e.g. grep matched-binary notes).
+        print(err_txt)
+    out_txt = proc.stdout.decode("utf-8", errors="replace")
+    if out_txt.endswith("\n"):
+        out_txt = out_txt[:-1]
+    return out_txt.split("\n") if out_txt else []
 
 
 def _showtech_cli_paginate(lines: List[str]) -> None:
@@ -5990,15 +6115,76 @@ def _showtech_cli_posix_tty_line(
     old = termios.tcgetattr(fd)
     hi = len(hist)
     buf: List[str] = list(initial) if initial else []
+    cursor: int = len(buf)
 
     def redraw() -> None:
         sys.stdout.write("\r\033[K" + prompt + "".join(buf))
+        # Move terminal cursor back to logical cursor position.
+        n_left = len(buf) - cursor
+        if n_left > 0:
+            sys.stdout.write(f"\x1b[{n_left}D")
         sys.stdout.flush()
 
     def finish(ok: str) -> str:
         sys.stdout.write("\n")
         sys.stdout.flush()
         return ok.strip()
+
+    def hist_up() -> None:
+        nonlocal hi, buf, cursor
+        if not hist:
+            return
+        if hi == len(hist):
+            hi = len(hist) - 1
+        elif hi > 0:
+            hi -= 1
+        buf = list(hist[hi])
+        cursor = len(buf)
+        redraw()
+
+    def hist_down() -> None:
+        nonlocal hi, buf, cursor
+        if not hist:
+            return
+        if hi < len(hist) - 1:
+            hi += 1
+            buf = list(hist[hi])
+        elif hi == len(hist) - 1:
+            hi = len(hist)
+            buf = []
+        cursor = len(buf)
+        redraw()
+
+    def move_left() -> None:
+        nonlocal cursor
+        if cursor > 0:
+            cursor -= 1
+            redraw()
+
+    def move_right() -> None:
+        nonlocal cursor
+        if cursor < len(buf):
+            cursor += 1
+            redraw()
+
+    def move_home() -> None:
+        nonlocal cursor
+        if cursor != 0:
+            cursor = 0
+            redraw()
+
+    def move_end() -> None:
+        nonlocal cursor
+        if cursor != len(buf):
+            cursor = len(buf)
+            redraw()
+
+    def del_at_cursor() -> None:
+        """Forward-delete (Delete key / Ctrl-D mid-line)."""
+        nonlocal buf
+        if cursor < len(buf):
+            del buf[cursor]
+            redraw()
 
     try:
         tty.setcbreak(fd)
@@ -6012,56 +6198,52 @@ def _showtech_cli_posix_tty_line(
                 exp = _cli_expand_full_input_line(trie, line) if trie else line.strip()
                 return finish(exp)
             if ch in ("\x7f", "\x08"):
-                if buf:
-                    buf.pop()
+                # Backspace at cursor: delete the char to the left of cursor.
+                if cursor > 0:
+                    del buf[cursor - 1]
+                    cursor -= 1
                     redraw()
                 continue
-            if ch == "\x04" and not buf:
-                raise EOFError
+            if ch == "\x04":
+                # Ctrl-D: EOF on empty line, forward-delete otherwise.
+                if not buf:
+                    raise EOFError
+                del_at_cursor()
+                continue
             if ch == "\x03":
                 buf.clear()
+                cursor = 0
                 sys.stdout.write("^C\n")
                 sys.stdout.flush()
                 return finish("")
+            if ch == "\x01":  # Ctrl-A
+                move_home()
+                continue
+            if ch == "\x05":  # Ctrl-E
+                move_end()
+                continue
+            if ch == "\x0b":  # Ctrl-K: kill to end of line
+                if cursor < len(buf):
+                    del buf[cursor:]
+                    redraw()
+                continue
+            if ch == "\x15":  # Ctrl-U: kill from start to cursor
+                if cursor > 0:
+                    del buf[:cursor]
+                    cursor = 0
+                    redraw()
+                continue
             if ch == "\x1b":
-                # Arrow keys and other escapes — read the full sequence in one go.
-                # If we return early after only ESC, '[' and 'A' leak into the line as literals
-                # (common with IDE terminals that delay bytes after ESC).
-                def hist_up() -> None:
-                    nonlocal hi, buf
-                    if not hist:
-                        return
-                    if hi == len(hist):
-                        hi = len(hist) - 1
-                    elif hi > 0:
-                        hi -= 1
-                    buf = list(hist[hi])
-                    redraw()
-
-                def hist_down() -> None:
-                    nonlocal hi, buf
-                    if not hist:
-                        return
-                    if hi < len(hist) - 1:
-                        hi += 1
-                        buf = list(hist[hi])
-                    elif hi == len(hist) - 1:
-                        hi = len(hist)
-                        buf = []
-                    redraw()
-
-                # Robust escape reader:
-                # 1) Wait up to ESC_TOTAL for the complete arrow sequence.
-                # 2) Interpret if it's an up/down arrow.
-                # 3) Drain for a short window to discard any leftover bytes (e.g. '['/'A'/'B')
-                #    that otherwise leak into printable token handling.
+                # CSI / SS3 escape sequence. Read the full sequence so leaked
+                # fragments don't end up as printable input. Common shapes:
+                #   ESC [ A/B/C/D/H/F       — arrows, Home, End
+                #   ESC O A/B/C/D/H/F       — same, application keypad mode
+                #   ESC [ 1~ / 4~ / 3~      — Home / End / Delete (xterm style)
                 import time
                 parts: List[str] = [ch]
                 MAX_ESC_BYTES = 8
-                # Keep ESC handling fast. If we fail to assemble the full arrow
-                # sequence due to terminal timing, the printable-path fallback
-                # below will still trigger hist_up/hist_down.
                 ESC_TOTAL = 0.06
+                CSI_FINAL = set("ABCDHF~")
                 esc_deadline = time.monotonic() + ESC_TOTAL
                 while len(parts) < MAX_ESC_BYTES and time.monotonic() < esc_deadline:
                     remaining = esc_deadline - time.monotonic()
@@ -6075,69 +6257,89 @@ def _showtech_cli_posix_tty_line(
                     parts.append(c)
                     if len(parts) == 2 and c not in "[O":
                         break
-                    if len(parts) >= 3:
-                        # For our purposes, arrow keys have fixed last byte A/B.
-                        if parts[1] == "O" and parts[2] in "AB":
-                            break
-                        if parts[1] == "[" and parts[2] in "AB":
-                            break
+                    if len(parts) >= 3 and parts[1] in "[O" and c in CSI_FINAL:
+                        break
 
                 seq = "".join(parts)
-
-                # NOTE: We intentionally do not "wait-more" here. Any leaked
-                # '[' + 'A'/'B' fragments will be handled in the printable-path
-                # fallback so Up/Down still works and remains responsive.
-
-                action: Optional[str] = None
-                if seq.startswith("\x1bO") and len(seq) >= 3:
-                    if seq[2] == "A":
+                if len(seq) >= 3 and seq[1] in "[O":
+                    final = seq[-1]
+                    if final == "A":
                         hist_up()
-                        action = "up"
-                    elif seq[2] == "B":
+                    elif final == "B":
                         hist_down()
-                        action = "down"
-                elif seq.startswith("\x1b[") and len(seq) >= 3:
-                    if seq[2] == "A":
-                        hist_up()
-                        action = "up"
-                    elif seq[2] == "B":
-                        hist_down()
-                        action = "down"
-
-                if len(seq) == 1:
-                    continue
+                    elif final == "C":
+                        move_right()
+                    elif final == "D":
+                        move_left()
+                    elif final == "H":
+                        move_home()
+                    elif final == "F":
+                        move_end()
+                    elif final == "~":
+                        # xterm-style: 1~ Home, 3~ Delete, 4~ End, 7~ Home, 8~ End
+                        middle = seq[2:-1]
+                        if middle in ("1", "7"):
+                            move_home()
+                        elif middle in ("4", "8"):
+                            move_end()
+                        elif middle == "3":
+                            del_at_cursor()
                 continue
             if ch == " ":
-                core = "".join(buf).rstrip()
-                exp = _cli_expand_full_input_line(trie, core) if trie else core
-                buf = list(exp + " ")
+                # Space at the END of the line triggers EOS-style expansion of the
+                # full input. When the cursor is mid-line, just insert a literal
+                # space at the cursor so editing existing text doesn't reshape it.
+                if cursor == len(buf):
+                    core = "".join(buf).rstrip()
+                    exp = _cli_expand_full_input_line(trie, core) if trie else core
+                    buf = list(exp + " ")
+                    cursor = len(buf)
+                else:
+                    buf.insert(cursor, " ")
+                    cursor += 1
                 redraw()
                 continue
             if ch == "\t":
                 if not trie:
                     continue
+                # Tab completion operates on the full line; cursor jumps to end
+                # afterwards so the result is consistent and printable.
                 before = "".join(buf)
-                had_trailing_space = before.endswith(" ")
                 core = before.rstrip()
                 new_line = _cli_tab_complete_line(trie, core)
                 buf = list(new_line)
+                cursor = len(buf)
                 redraw()
                 continue
             # Printable / UTF-8 continuation handled by read(1) one code point in text mode
             if ch.isprintable():
-                # If the terminal leaked an unfinished arrow escape as literal
-                # characters (typically `[` followed by `A`/`B`), consume those
-                # fragments so they don't become a command token.
-                if ch in ("A", "B") and buf and buf[-1] == "[":
-                    # Treat leaked arrow fragments as a real up/down key.
-                    buf.pop()
+                # Recover from leaked CSI fragments when the terminal split the
+                # ESC sequence beyond the deadline (`[A`/`[B`/`[C`/`[D`/`[H`/`[F`
+                # arriving as plain characters right after a literal '[').
+                if (
+                    ch in ("A", "B", "C", "D", "H", "F")
+                    and cursor > 0
+                    and buf[cursor - 1] == "["
+                ):
+                    del buf[cursor - 1]
+                    cursor -= 1
                     if ch == "A":
                         hist_up()
-                    else:
+                    elif ch == "B":
                         hist_down()
-                    redraw()
+                    elif ch == "C":
+                        move_right()
+                    elif ch == "D":
+                        move_left()
+                    elif ch == "H":
+                        move_home()
+                    elif ch == "F":
+                        move_end()
+                    else:
+                        redraw()
                     continue
-                buf.append(ch)
+                buf.insert(cursor, ch)
+                cursor += 1
                 if ch == "?":
                     line = "".join(buf)
                     exp = (
@@ -6219,7 +6421,10 @@ def run_interactive_showtech_cli(
         "Interactive show-tech CLI (first bundle). Commands: EOS-style abbreviations; "
         "'?' or 'word?' for next keywords (typing ? submits the line on POSIX TTY); "
         "Space/Enter/Tab expand unique abbreviations (Tab also lists candidates); "
-        "'| grep PAT' / '| include PAT'; Up/Down recall prior commands; exit/quit/^D to leave."
+        "chained pipes: EOS modifiers ('| include'/'| exclude'/'| begin'/'| section'/'| grep') "
+        "and arbitrary Linux commands ('| wc -l', '| sort -u', ...); "
+        "quote patterns containing '|' (e.g. grep \"aaa|bbb\"); "
+        "Up/Down recall prior commands; exit/quit/^D to leave."
     )
     pending_initial: Optional[str] = None
     while True:
@@ -6241,7 +6446,15 @@ def run_interactive_showtech_cli(
         try:
             if low in ("help", "?"):
                 print(
-                    "Examples:  show ?   show ver   sh ver|grep Arista\n"
+                    "Examples:  show ?   show ver   sh ver | grep Arista\n"
+                    "           sh ver | include Arista | exclude HW\n"
+                    "           sh int counters | grep \"Ethernet1|Ethernet2\" | wc -l\n"
+                    "           sh run | begin interface | section Ethernet1\n"
+                    "Pipe tail: chain '|' freely; segments are EOS modifiers\n"
+                    "  (include/exclude/begin/section/grep) or any Linux command.\n"
+                    "  Quote patterns containing '|' so they aren't split.\n"
+                    "  '| grep' uses extended regex by default (so '|' is OR);\n"
+                    "  pass '-F' for literal or '-G' for basic regex.\n"
                     "Pagination: Space = next page, q = stop output.\n"
                     "Line editing: Up/Down history; ASCII ? submits the line on POSIX TTY.\n"
                     "Space/Enter/Tab expand unique token abbreviations; Tab lists next keywords if needed.\n"
@@ -6249,7 +6462,7 @@ def run_interactive_showtech_cli(
                 )
                 continue
 
-            cmd_part, pipe_pat, pipe_kind = _parse_showtech_cli_pipe(raw)
+            cmd_part, pipe_segments = _parse_showtech_cli_pipe(raw, trie)
             help_spec = _parse_showtech_cli_help(cmd_part)
 
             if help_spec is not None:
@@ -6313,7 +6526,7 @@ def run_interactive_showtech_cli(
                 is_leaf = False
 
             body = _format_showtech_cli_matches(matched)
-            body = _showtech_cli_apply_grep(body, pipe_pat, pipe_kind)
+            body = _apply_pipe_segments(body, pipe_segments)
             _showtech_cli_paginate(body)
             if is_leaf:
                 # Only record successful leaf-node commands.
