@@ -34,7 +34,7 @@ from typing import Callable, Dict, Iterable, List, Optional, Sequence, Tuple
 
 __author__ = "chris.li@arista.com"
 __last_modified__ = "2026-05-26"
-__version__ = "1.4.10"
+__version__ = "1.4.11"
 
 
 LOG = logging.getLogger("health_check_eos")
@@ -5756,10 +5756,19 @@ def _longest_common_prefix_ci(strs: Sequence[str]) -> str:
     return first[:end]
 
 
-def _cli_tab_complete_line(trie: _ShowTechCommandTrie, core: str) -> str:
+def _cli_tab_complete_line(
+    trie: _ShowTechCommandTrie,
+    core: str,
+    *,
+    last_token_complete: bool = False,
+) -> str:
     """
     Tab: first apply unique abbrev expansion; if unchanged, complete the last token or
     print candidate list (root, next-level keywords, or subcommands when last token is exact).
+
+    ``last_token_complete`` reflects whether the user's raw input had trailing whitespace
+    before ``core`` was stripped. When True, the last token has been committed and Tab
+    drills into the resolved node's children instead of treating the token as a partial.
     """
     exp = _cli_expand_full_input_line(trie, core)
     if exp != core:
@@ -5802,23 +5811,31 @@ def _cli_tab_complete_line(trie: _ShowTechCommandTrie, core: str) -> str:
         print("\n" + "\n".join(keys), flush=True)
         return core
 
+    # Trailing whitespace = user committed the last token; list/complete the next
+    # keyword instead of re-treating the committed token as a partial. This is how
+    # ``show interface `` + Tab drills into ``interface``'s children, while
+    # ``show interface`` + Tab (no space) keeps the interface/interfaces ambiguity.
+    if last_token_complete:
+        keys, err = trie.help_candidates(parts, "")
+        if err:
+            print(f"\n{err}", flush=True)
+            return core
+        if not keys:
+            return core
+        if len(keys) == 1:
+            return merge(" ".join(parts + [keys[0]]), space_after=True)
+        print("\n" + "\n".join(keys), flush=True)
+        return core
+
     pref, last = parts[:-1], parts[-1]
     keys, err = trie.help_candidates(pref, last)
     if err:
         print(f"\n{err}", flush=True)
         return core
 
-    # Match execution semantics: a token that equals a full child keyword (e.g. ``ip``)
-    # is not ambiguous with longer siblings (``ipv6``). help_candidates keeps prefix
-    # filtering for ``?``/refine; Tab narrows here so ``show ip`` + Tab lists ``ip``'s subtree.
-    if len(keys) > 1 and last:
-        exact = [k for k in keys if k.lower() == last.lower()]
-        if len(exact) == 1:
-            keys = exact
-
     if len(keys) == 1:
         nk = keys[0]
-        if nk != last:
+        if nk.lower() != last.lower():
             ret1 = merge(" ".join(pref + [nk]), space_after=True)
             return ret1
         keys2, err2 = trie.help_candidates(parts, "")
@@ -5842,6 +5859,9 @@ def _cli_tab_complete_line(trie: _ShowTechCommandTrie, core: str) -> str:
         # If all candidates share a prefix longer than ``last`` (e.g. ``int`` →
         # ``interface`` for {interface, interfaces}), extend the token without
         # adding a trailing space so the user can keep disambiguating.
+        # When ``last`` already equals the shared prefix (e.g. typed ``interface``
+        # with sibling ``interfaces``), no narrowing happens — the user must add
+        # a space (or more characters) to commit before drilling further.
         common = _longest_common_prefix_ci(keys)
         if common and len(common) > len(last):
             return merge(" ".join(pref + [common]), space_after=False)
@@ -6329,10 +6349,16 @@ def _showtech_cli_posix_tty_line(
                 if not trie:
                     continue
                 # Tab completion operates on the full line; cursor jumps to end
-                # afterwards so the result is consistent and printable.
+                # afterwards so the result is consistent and printable. Preserve
+                # whether the user had trailing whitespace so completion can tell
+                # ``show interface`` (partial, keep ambiguity) from
+                # ``show interface `` (committed, drill into children).
                 before = "".join(buf)
                 core = before.rstrip()
-                new_line = _cli_tab_complete_line(trie, core)
+                last_complete = len(before) > len(core)
+                new_line = _cli_tab_complete_line(
+                    trie, core, last_token_complete=last_complete
+                )
                 buf = list(new_line)
                 cursor = len(buf)
                 redraw()
