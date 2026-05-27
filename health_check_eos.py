@@ -34,7 +34,7 @@ from typing import Callable, Dict, Iterable, List, Optional, Sequence, Tuple
 
 __author__ = "chris.li@arista.com"
 __last_modified__ = "2026-05-26"
-__version__ = "1.4.9"
+__version__ = "1.4.10"
 
 
 LOG = logging.getLogger("health_check_eos")
@@ -5736,6 +5736,26 @@ def _cli_join_cmd_pipe(left: str, right: str) -> str:
     return merged
 
 
+def _longest_common_prefix_ci(strs: Sequence[str]) -> str:
+    """Longest common prefix across *strs* under case-insensitive comparison.
+
+    Casing is taken from the first string. Returns ``""`` for an empty input.
+    """
+    if not strs:
+        return ""
+    first = strs[0]
+    end = len(first)
+    for s in strs[1:]:
+        m = min(end, len(s))
+        i = 0
+        while i < m and first[i].lower() == s[i].lower():
+            i += 1
+        end = i
+        if end == 0:
+            break
+    return first[:end]
+
+
 def _cli_tab_complete_line(trie: _ShowTechCommandTrie, core: str) -> str:
     """
     Tab: first apply unique abbrev expansion; if unchanged, complete the last token or
@@ -5819,6 +5839,12 @@ def _cli_tab_complete_line(trie: _ShowTechCommandTrie, core: str) -> str:
 
     if len(keys) > 1:
         print("\n" + "\n".join(keys), flush=True)
+        # If all candidates share a prefix longer than ``last`` (e.g. ``int`` →
+        # ``interface`` for {interface, interfaces}), extend the token without
+        # adding a trailing space so the user can keep disambiguating.
+        common = _longest_common_prefix_ci(keys)
+        if common and len(common) > len(last):
+            return merge(" ".join(pref + [common]), space_after=False)
         return core
 
     keys2, err2 = trie.help_candidates(parts, "")
