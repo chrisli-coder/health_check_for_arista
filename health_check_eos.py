@@ -34,7 +34,7 @@ from typing import Callable, Dict, Iterable, List, Optional, Sequence, Tuple
 
 __author__ = "chris.li@arista.com"
 __last_modified__ = "2026-05-26"
-__version__ = "1.4.12"
+__version__ = "1.4.13"
 
 
 LOG = logging.getLogger("health_check_eos")
@@ -5776,7 +5776,24 @@ def _cli_tab_complete_line(
         right0 = core[idx0:] if idx0 < len(core) else ""
         if not right0.strip():
             e = exp.rstrip()
-            ret = (e + " ") if e else exp
+            # Only append a trailing space (committing the last token) when:
+            #   (a) the user's last typed token was actually expanded — e.g.
+            #       ``sh ver`` -> ``show version `` — OR
+            #   (b) the user had already committed it with whitespace — e.g.
+            #       ``sh int `` keeps its trailing space.
+            # When only an EARLIER token was expanded and the last token stayed
+            # partial/ambiguous (``sh int`` -> ``show int``), adding a space
+            # would prematurely commit the ambiguous token and prevent the
+            # follow-up Tab from doing longest-common-prefix completion.
+            core_parts = core.rstrip().split()
+            exp_parts = e.split()
+            last_token_expanded = (
+                bool(core_parts)
+                and bool(exp_parts)
+                and core_parts[-1] != exp_parts[-1]
+            )
+            add_space = bool(e) and (last_token_expanded or last_token_complete)
+            ret = (e + " ") if add_space else e
         else:
             ret = exp.strip()
         return ret
