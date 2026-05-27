@@ -34,7 +34,7 @@ from typing import Callable, Dict, Iterable, List, Optional, Sequence, Tuple
 
 __author__ = "chris.li@arista.com"
 __last_modified__ = "2026-05-26"
-__version__ = "1.4.13"
+__version__ = "1.4.14"
 
 
 LOG = logging.getLogger("health_check_eos")
