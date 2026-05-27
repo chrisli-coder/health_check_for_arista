@@ -34,7 +34,7 @@ from typing import Callable, Dict, Iterable, List, Optional, Sequence, Tuple
 
 __author__ = "chris.li@arista.com"
 __last_modified__ = "2026-05-26"
-__version__ = "1.4.11"
+__version__ = "1.4.12"
 
 
 LOG = logging.getLogger("health_check_eos")
@@ -5819,13 +5819,15 @@ def _cli_tab_complete_line(
         keys, err = trie.help_candidates(parts, "")
         if err:
             print(f"\n{err}", flush=True)
-            return core
+            return merge(" ".join(parts), space_after=True)
         if not keys:
-            return core
+            return merge(" ".join(parts), space_after=True)
         if len(keys) == 1:
             return merge(" ".join(parts + [keys[0]]), space_after=True)
         print("\n" + "\n".join(keys), flush=True)
-        return core
+        # Preserve the trailing space the user already typed so repeated Tab
+        # presses don't make the cursor bounce between len(core) and len(core)+1.
+        return merge(" ".join(parts), space_after=True)
 
     pref, last = parts[:-1], parts[-1]
     keys, err = trie.help_candidates(pref, last)
