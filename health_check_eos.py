@@ -33,8 +33,8 @@ from enum import Enum
 from typing import Callable, Dict, Iterable, List, Optional, Sequence, Tuple
 
 __author__ = "chris.li@arista.com"
-__last_modified__ = "2026-05-26"
-__version__ = "1.4.14"
+__last_modified__ = "2026-05-29"
+__version__ = "1.4.15"
 
 
 LOG = logging.getLogger("health_check_eos")
@@ -5649,17 +5649,11 @@ class _ShowTechCommandTrie:
         if err:
             return None, err
         assert node is not None
-        # Strict tree semantics per requirements:
-        # If a command node has both (1) a runnable section here (blocks_here) and
-        # (2) multiple child keywords, we must NOT execute the parent command.
-        # The user must refine the command further (or use '?').
+        # If this node has its own captured section (blocks_here), run it — even
+        # when deeper sibling sections also exist (e.g. show-tech captures both
+        # ``show lldp`` and ``show lldp counters`` as separate sections; both
+        # must be reachable via the CLI).
         if node.blocks_here:
-            if len(node.children) > 1:
-                nxt = sorted(node.children.keys())
-                hint = "\n".join(f"  {c}" for c in nxt)
-                return None, (
-                    "Incomplete command; type '?' to list next keywords:\n" + hint
-                )
             return node.blocks_here, None
         nxt = sorted(node.children.keys())
         hint = "\n".join(f"  {c}" for c in nxt)
