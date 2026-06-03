@@ -34,7 +34,7 @@ from typing import Callable, Dict, Iterable, List, Optional, Sequence, Tuple
 
 __author__ = "chris.li@arista.com"
 __last_modified__ = "2026-05-29"
-__version__ = "1.4.15"
+__version__ = "1.4.16"
 
 
 LOG = logging.getLogger("health_check_eos")
@@ -5336,7 +5336,29 @@ def format_json_report(
             "warn_count": brief.warn_count,
         },
     }
-    if mode == "verbose":
+    if mode == "summary":
+        data["checks"] = [
+            {
+                "name": r.name,
+                "category": r.category,
+                "severity": r.severity.value,
+                "summary": r.summary,
+            }
+            for r in results
+        ]
+    elif mode == "warn":
+        data["checks"] = [
+            {
+                "name": r.name,
+                "category": r.category,
+                "severity": r.severity.value,
+                "summary": r.summary,
+                "details": r.details,
+            }
+            for r in results
+            if r.severity == Severity.WARN
+        ]
+    elif mode == "verbose":
         data["checks"] = [
             {
                 "name": r.name,
